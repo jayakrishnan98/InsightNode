@@ -2,7 +2,8 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 1 complete**
+**Current stage: Phase 1 complete (Days 1–12)**  
+**Next: Phase 2 — Day 13 (Redis durable queue)**
 
 Phase 1 uses Python, FastAPI, and PostgreSQL only. No Kafka, Redis, ClickHouse, or Kubernetes yet.
 
@@ -10,13 +11,18 @@ Phase 1 uses Python, FastAPI, and PostgreSQL only. No Kafka, Redis, ClickHouse, 
 
 ## What it does
 
-InsightNode collects host metrics (CPU, memory, disk) from a local agent, ingests them through a FastAPI backend, stores them in PostgreSQL, and exposes a query API.
+InsightNode collects host metrics (CPU, memory, disk) from a local agent, ingests them through a FastAPI backend, stores them in PostgreSQL, and exposes raw and aggregated query APIs.
 
 ```
-Agent (psutil)  →  POST /metrics  →  In-memory queue  →  Worker  →  PostgreSQL
-                      (202 fast)         (buffer)         (batch)      (storage)
-                                                                           ↑
-                                                                    GET /metrics
+Agent (psutil + spool)
+    │  POST /metrics {event_id, ...}
+    ▼
+FastAPI ──enqueue──► In-memory Queue ──worker──► PostgreSQL
+  │ 202 fast              (buffer)         (batch + dedup)
+  │
+  ├── GET /metrics           (raw points)
+  ├── GET /metrics/aggregate (avg/min/max buckets)
+  └── GET /health            (queue + worker status)
 ```
 
 ### Features (Phase 1)
@@ -26,7 +32,9 @@ Agent (psutil)  →  POST /metrics  →  In-memory queue  →  Worker  →  Post
 | **Agent** | Collects CPU, memory, and disk gauges every 5 seconds |
 | **Ingestion API** | Validates payloads with Pydantic, enqueues for async processing |
 | **Background worker** | Batch-writes to PostgreSQL (up to 50 payloads per commit) |
-| **Query API** | Filter by `machine_id`, `metric_name`, time range |
+| **Query API** | Filter raw points by `machine_id`, `metric_name`, time range |
+| **Aggregation API** | Time-bucketed avg, min, max, sample_count |
+| **Idempotency** | `event_id` per payload + dedup on insert |
 | **Health endpoint** | Queue depth, worker status |
 | **Agent resilience** | Exponential backoff retries + on-disk spool when API is down |
 | **Worker resilience** | Re-queues failed batches (up to 3 attempts) |
@@ -42,12 +50,20 @@ InsightNode/
 │   ├── spool.py         # NDJSON disk buffer for failed payloads
 │   └── data/            # Runtime spool file (gitignored)
 ├── backend/
-│   ├── main.py          # FastAPI app — ingest, query, health
+│   ├── main.py          # FastAPI app — ingest, query, aggregate, health
 │   ├── worker.py        # Background consumer — queue → PostgreSQL
 │   ├── database.py      # SQLAlchemy engine and session setup
 │   └── models.py        # MetricRecord ORM model
+├── docs/
+│   ├── architecture.md
+│   ├── request-flows.md
+│   ├── database-schema.md
+│   ├── bottlenecks-and-roadmap.md
+│   └── phase-1-graduation.md
 ├── sql/
-│   └── schema.sql       # PostgreSQL table and indexes
+│   ├── schema.sql
+│   └── migrations/
+│       └── 001_add_event_id.sql
 └── requirements.txt
 ```
 
@@ -73,7 +89,6 @@ pip install -r requirements.txt
 ### 2. Create the database
 
 ```bash
-# Using psql (adjust user/password as needed)
 createdb insightnode
 
 # Or via psql:
@@ -81,6 +96,7 @@ createdb insightnode
 # CREATE DATABASE insightnode OWNER insightnode;
 
 psql -U insightnode -d insightnode -f sql/schema.sql
+psql -U insightnode -d insightnode -f sql/migrations/001_add_event_id.sql
 ```
 
 ### 3. Configure database URL (optional)
@@ -106,10 +122,10 @@ Run from the **project root** (`InsightNode/`).
 ### Start the API
 
 ```bash
-uvicorn backend.main:app --reload
+uvicorn backend.main:app --reload --port 8001
 ```
 
-API docs: http://127.0.0.1:8000/docs
+API docs: http://127.0.0.1:8001/docs
 
 ### Start the agent
 
@@ -138,6 +154,7 @@ Accepts a JSON payload and returns `202 Accepted` immediately. Persistence happe
 
 ```json
 {
+  "event_id": "550e8400-e29b-41d4-a716-446655440000",
   "machine_id": "my-machine",
   "timestamp": "2026-06-19T06:56:00.843013+00:00",
   "metrics": [
@@ -148,9 +165,10 @@ Accepts a JSON payload and returns `202 Accepted` immediately. Persistence happe
 }
 ```
 
-Returns `503` if the ingest queue is full (backpressure).
+- Returns `503` if the ingest queue is full (backpressure)
+- Duplicate `event_id` + `metric_name` for the same machine are ignored at storage (idempotent)
 
-### `GET /metrics` — Query stored metrics
+### `GET /metrics` — Query stored metrics (raw)
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
@@ -163,7 +181,23 @@ Returns `503` if the ingest queue is full (backpressure).
 Example:
 
 ```bash
-curl "http://127.0.0.1:8000/metrics?machine_id=my-machine&metric_name=cpu_usage&limit=10"
+curl "http://127.0.0.1:8001/metrics?machine_id=my-machine&metric_name=cpu_usage&limit=10"
+```
+
+### `GET /metrics/aggregate` — Query aggregated buckets
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `machine_id` | string | Yes | Filter by host |
+| `metric_name` | string | Yes | Filter by metric |
+| `start_time` | ISO 8601 | Yes | Range start |
+| `end_time` | ISO 8601 | Yes | Range end (exclusive) |
+| `interval` | string | No | `1m`, `5m`, `15m`, `1h`, `3h`, `6h`, `12h`, `24h`, `1d` (default `5m`) |
+
+Example:
+
+```bash
+curl "http://127.0.0.1:8001/metrics/aggregate?machine_id=my-machine&metric_name=cpu_usage&start_time=2026-07-10T05:00:00%2B00:00&end_time=2026-07-10T06:00:00%2B00:00&interval=5m"
 ```
 
 ### `GET /health` — Pipeline health
@@ -191,24 +225,31 @@ Table: `metrics` (one row per metric sample)
 | `value` | DOUBLE PRECISION | Observed value |
 | `unit` | VARCHAR(50) | e.g. `percent` |
 | `timestamp` | TIMESTAMPTZ | Agent observation time (UTC) |
+| `event_id` | UUID | Idempotency key (nullable for pre-Day-11 rows) |
 | `created_at` | TIMESTAMPTZ | Server insert time |
 
 Indexes:
 
 - `idx_metrics_timestamp` — time-range scans
 - `idx_metrics_machine_metric_time` — filtered queries by host + metric + time
+- `idx_metrics_dedup` — unique `(machine_id, event_id, metric_name)` where `event_id IS NOT NULL`
+
+See [docs/database-schema.md](docs/database-schema.md) for full details.
 
 ---
 
 ## Architecture
 
+See [docs/architecture.md](docs/architecture.md) for system diagrams and design decisions.
+
 ### Ingestion flow
 
 1. Agent samples OS metrics via `psutil` (5-second CPU window).
-2. Agent POSTs JSON to `/metrics`.
-3. FastAPI validates the payload and enqueues it (non-blocking).
-4. API responds `202` immediately.
-5. Background worker dequeues payloads in batches and commits to PostgreSQL.
+2. Agent assigns a unique `event_id` (UUID) per collection cycle.
+3. Agent POSTs JSON to `/metrics`.
+4. FastAPI validates the payload and enqueues it (non-blocking).
+5. API responds `202` immediately.
+6. Background worker dequeues payloads in batches and idempotently inserts into PostgreSQL.
 
 ### Failure handling
 
@@ -222,31 +263,35 @@ Indexes:
 
 - If PostgreSQL is temporarily unavailable, the worker re-queues failed payloads (up to 3 attempts).
 - If the in-memory queue is full, the API returns `503` so agents back off or spool.
+- Duplicate payloads (same `event_id`) are silently skipped at insert.
+
+See [docs/request-flows.md](docs/request-flows.md) for sequence diagrams.
 
 ---
 
 ## Known limitations (by design)
 
-These are intentional Phase 1 constraints. They motivate Phase 2.
+These intentional Phase 1 constraints motivate Phase 2+.
 
 | Limitation | Impact |
 |------------|--------|
 | In-memory queue | Metrics in the queue are lost if the API process crashes |
-| PostgreSQL for time-series | Slow at very high cardinality and volume |
-| No deduplication | Spool replay can insert duplicate rows |
-| No aggregations | Query returns raw points only (no avg/min/max buckets) |
-| Single process | No horizontal scaling |
+| PostgreSQL for time-series | Slow at very high cardinality and volume; aggregation scans get expensive |
+| Single API process | No horizontal scaling |
 | Retry storm | Agent spends a long time retrying when API is down for extended periods |
+| No retention policy | Table grows indefinitely |
+| No percentiles (p95) | Deferred to a later phase |
+
+See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale analysis.
 
 ---
 
 ## Roadmap
 
-### Phase 2 (next)
+### Phase 2 (Day 13+) — Durable buffering
 
-- Redis or Kafka for durable, distributed buffering
-- Replace in-memory queue
-- Understand backpressure and decoupling at scale
+- Redis replaces in-memory queue
+- Survives API restarts; foundation for horizontal scaling
 
 ### Later phases
 
@@ -268,7 +313,11 @@ These are intentional Phase 1 constraints. They motivate Phase 2.
 - [x] Query metrics by host, name, and time range
 - [x] Decouple ingestion from storage (queue + worker)
 - [x] Handle failures with retries, disk spool, and worker re-queue
-- [x] Identify scalability bottlenecks before introducing advanced tooling
+- [x] Aggregate metrics into time buckets (Day 10)
+- [x] Implement idempotency keys for at-least-once delivery (Day 11)
+- [x] Document architecture, flows, schema, and bottlenecks (Day 12)
+
+**Phase 1 graduation:** [docs/phase-1-graduation.md](docs/phase-1-graduation.md)
 
 ---
 

@@ -10,12 +10,13 @@ import socket
 import psutil
 import httpx
 from datetime import datetime, timezone
+import uuid
 
 import spool
 
 MACHINE_ID = socket.gethostname()
 COLLECTION_INTERVAL_SECONDS = 5
-API_URL = "http://127.0.0.1:8000/metrics"
+API_URL = "http://127.0.0.1:8001/metrics"
 MAX_RETRIES = 5
 RETRY_BASE_DELAY_SECONDS = 1.0
 
@@ -28,18 +29,21 @@ def collect_metrics() -> dict:
         - Block for COLLECTION_INTERVAL_SECONDS while measuring CPU (psutil needs
           a sampling window to compute a meaningful percentage).
         - Read memory and disk gauges in the same pass.
-        - Build one payload dict: machine_id, UTC timestamp, and a list of metrics.
+        - Generate event_id (UUID) once per collection cycle.
+        - Build one payload dict: event_id, machine_id, UTC timestamp, metrics.
 
     Reason:
         Observability starts at the source. Each metric is a gauge (current value),
         not a counter. UTC + ISO 8601 keeps timestamps unambiguous across machines
-        and time zones.
+        and time zones. event_id is stable across retries and spool replay so the
+        API can deduplicate at-least-once deliveries.
     """
     cpu = psutil.cpu_percent(interval=COLLECTION_INTERVAL_SECONDS)
     memory = psutil.virtual_memory()
     disk = psutil.disk_usage("/")
 
     return {
+        "event_id": str(uuid.uuid4()),
         "machine_id": MACHINE_ID,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "metrics": [
@@ -107,7 +111,8 @@ def replay_spool() -> None:
     Reason:
         Disk spool survives agent restarts and long API outages. Replaying before
         each new collection prioritizes clearing backlog over ingesting fresh data.
-        Tradeoff: at-least-once delivery — a crash mid-replay can cause duplicates.
+        Tradeoff: at-least-once delivery — a crash mid-replay may re-send payloads,
+        but Day 11 idempotency (event_id) prevents duplicate rows in PostgreSQL.
     """
     buffered = spool.read_all()
     if not buffered:

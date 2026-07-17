@@ -2,11 +2,12 @@
 InsightNode API — ingestion and query endpoints for host metrics.
 
 Architecture:
-    Agent --POST /metrics--> in-memory queue --worker thread--> PostgreSQL
-                              (fast 202)                    (batched writes)
+    Agent --POST /metrics--> Redis List --worker thread--> PostgreSQL
+                              (fast 202)     (durable buffer)   (batched writes)
 
 The HTTP handler does not write to the database directly. That decouples accept
-latency from PostgreSQL commit time and absorbs short write spikes in the queue.
+latency from PostgreSQL commit time. Redis keeps buffered payloads across API
+process restarts (Phase 2).
 """
 
 from datetime import datetime, timezone
@@ -15,7 +16,6 @@ from typing import Optional, Literal
 import logging
 import threading
 from contextlib import asynccontextmanager
-from queue import Full, Queue
 
 from fastapi import Depends, FastAPI, Query, HTTPException
 from pydantic import BaseModel, Field
@@ -24,9 +24,18 @@ from sqlalchemy.orm import Session
 
 from backend.database import get_db
 from backend.models import MetricRecord
+from backend.redis_client import (
+    QUEUE_MAX_LENGTH,
+    QueueFullError,
+    enqueue_payload,
+    get_redis,
+    ping,
+    queue_length,
+)
+from backend.worker import run_ingest_worker
 
 logger = logging.getLogger(__name__)
-ingest_queue: Queue = Queue(maxsize=10000)
+redis_client = get_redis()
 stop_event = threading.Event()
 worker_thread: threading.Thread | None = None
 
@@ -42,41 +51,38 @@ INTERVAL_MAP: dict[str, str] = {
     "1d": "1 day",
 }
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-  """
-  Start and stop the background ingest worker with the FastAPI application.
+    """
+    Start and stop the Redis-backed ingest worker with the FastAPI application.
 
-  Logic:
-      - On startup: clear stop_event, spawn a daemon thread running run_ingest_worker.
-      - yield — app serves traffic while the worker drains the queue.
-      - On shutdown: set stop_event, join the worker (up to 5s) so it can finish.
+    Logic:
+        - On startup: clear stop_event, spawn worker thread with redis_client.
+        - yield — app serves traffic while the worker drains Redis.
+        - On shutdown: set stop_event, join the worker (up to 5s).
 
-  Reason:
-      The worker must share the same process and ingest_queue as the API handlers.
-      FastAPI lifespan is the supported hook for this; without it, POST /metrics
-      would enqueue data that nothing consumes.
-  """
-  global worker_thread
+    Reason:
+        Worker must share the same Redis list as POST /metrics handlers.
+    """
+    global worker_thread
 
-  from backend.worker import run_ingest_worker
+    stop_event.clear()
+    worker_thread = threading.Thread(
+        target=run_ingest_worker,
+        args=(redis_client, stop_event),
+        name="ingest-worker",
+        daemon=True,
+    )
+    worker_thread.start()
+    logger.info("Ingest worker started (Redis queue)")
 
-  stop_event.clear()
-  worker_thread = threading.Thread(
-    target=run_ingest_worker,
-    args=(ingest_queue, stop_event),
-    name="ingest-worker",
-    daemon=True,
-  )
-  worker_thread.start()
-  logger.info("Ingest worker started")
+    yield
 
-  yield
-
-  stop_event.set()
-  if worker_thread is not None:
-    worker_thread.join(timeout=5.0)
-    logger.info("Ingest worker stopped")
+    stop_event.set()
+    if worker_thread is not None:
+        worker_thread.join(timeout=5.0)
+        logger.info("Ingest worker stopped")
 
 
 app = FastAPI(title="InsightNode", version="0.1.0", lifespan=lifespan)
@@ -136,23 +142,24 @@ class MetricsQueryResponse(BaseModel):
 
 @app.get("/health")
 def health_check():
-  """
-  Liveness probe and ingest pipeline visibility.
+    """
+    Liveness probe and ingest pipeline visibility.
 
-  Logic:
-      - Return static status "ok".
-      - Expose current queue depth, max capacity, and whether the worker thread is alive.
+    Logic:
+        - Ping Redis and report list depth + worker thread status.
 
-  Reason:
-      Operators (and future you) need to see backpressure before agents time out.
-      A growing queue_size with worker_alive=false signals a stuck or crashed worker.
-  """
-  return {
-    "status": "ok",
-    "queue_size": ingest_queue.qsize(),
-    "queue_maxsize": ingest_queue.maxsize,
-    "worker_alive": worker_thread.is_alive() if worker_thread else False,
-  }
+    Reason:
+        Growing queue_size with redis_ok=true means the worker is falling behind.
+        redis_ok=false means the durable buffer itself is unreachable.
+    """
+    return {
+        "status": "ok",
+        "redis_ok": ping(redis_client),
+        "queue_size": queue_length(redis_client),
+        "queue_maxsize": QUEUE_MAX_LENGTH,
+        "queue_backend": "redis",
+        "worker_alive": worker_thread.is_alive() if worker_thread else False,
+    }
 
 
 @app.get("/metrics", response_model=MetricsQueryResponse)
@@ -214,44 +221,45 @@ def query_metrics(
 
 @app.post("/metrics", status_code=202)
 def ingest_metrics(payload: MetricsPayload):
-  """
-  Accept metrics from agents — enqueue for async persistence, respond immediately.
+    """
+    Accept metrics from agents — enqueue to Redis for async persistence.
 
-  Logic:
-      - Validate body via Pydantic (MetricsPayload).
-      - Serialize to a JSON-safe dict; stamp _retry_count=0 for worker retry tracking.
-      - Non-blocking put on ingest_queue; if full, return 503 (backpressure).
-      - Return 202 Accepted with queue depth (data not yet in PostgreSQL).
+    Logic:
+        - Validate body via Pydantic (MetricsPayload).
+        - Serialize to JSON-safe dict; stamp _retry_count=0 for worker retries.
+        - LPUSH onto Redis list; if at max length, return 503 (backpressure).
+        - Return 202 Accepted with current queue depth.
 
-  Reason:
-      202 means "accepted for processing," not "stored." Agents get fast ACKs even
-      when PostgreSQL is slow. block=False avoids hanging HTTP threads when the
-      queue is full — the agent should retry or spool instead.
-  """
-  # model_dump(mode="json") → JSON-safe dict (datetime → ISO string)
-  item = payload.model_dump(mode="json")
-  item["_retry_count"] = 0
+    Reason:
+        Redis survives API restarts (unlike Phase 1 in-memory queue).
+        202 means accepted for processing, not yet in PostgreSQL.
+    """
+    item = payload.model_dump(mode="json")
+    item["_retry_count"] = 0
 
-  try:
-    ingest_queue.put(item, block=False)
-  except Full:
-    logger.warning("Ingest queue full — rejecting payload")
-    from fastapi import HTTPException
-    raise HTTPException(status_code=503, detail="Ingest queue full, try again later")
+    try:
+        enqueue_payload(redis_client, item)
+    except QueueFullError:
+        logger.warning("Redis ingest queue full — rejecting payload")
+        raise HTTPException(
+            status_code=503,
+            detail="Ingest queue full, try again later",
+        )
 
-  logger.info(
-    "Enqueued metrics machine=%s metric_count=%s queue_size=%s",
-    payload.machine_id,
-    len(payload.metrics),
-    ingest_queue.qsize(),
-  )
+    depth = queue_length(redis_client)
+    logger.info(
+        "Enqueued metrics machine=%s metric_count=%s queue_size=%s",
+        payload.machine_id,
+        len(payload.metrics),
+        depth,
+    )
 
-  return {
-    "status": "accepted",
-    "machine_id": payload.machine_id,
-    "metric_count": len(payload.metrics),
-    "queued": ingest_queue.qsize(),
-  }
+    return {
+        "status": "accepted",
+        "machine_id": payload.machine_id,
+        "metric_count": len(payload.metrics),
+        "queued": depth,
+    }
 
 
 @app.get("/metrics/aggregate", response_model=MetricsAggregateResponse)

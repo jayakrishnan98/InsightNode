@@ -1,5 +1,5 @@
 """
-Background worker — drains the ingest queue and batch-writes to PostgreSQL.
+Background worker — drains the Redis ingest queue and batch-writes to PostgreSQL.
 
 Runs in a separate thread (started from backend.main lifespan). Batching reduces
 commit overhead; failed batches are re-queued with a retry cap to handle transient DB errors.
@@ -7,14 +7,20 @@ commit overhead; failed batches are re-queued with a retry cap to handle transie
 
 import logging
 import threading
-from queue import Empty, Full, Queue
 
-from sqlalchemy.orm import Session
+from redis import Redis
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from backend.database import SessionLocal
 from backend.models import MetricRecord
+from backend.redis_client import (
+    QueueFullError,
+    dequeue_payload,
+    enqueue_payload_retry,
+    try_dequeue_nowait,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,48 +91,40 @@ def _flush_batch(db: Session, batch: list[dict]) -> None:
     )
 
 
-def run_ingest_worker(ingest_queue: Queue, stop_event: threading.Event) -> None:
+def run_ingest_worker(redis_client: Redis, stop_event: threading.Event) -> None:
     """
-    Long-running consumer loop: dequeue payloads, batch, persist, handle failures.
+    Drain Redis ingest list and batch-write to PostgreSQL.
 
     Logic:
-        1. Wait up to BATCH_TIMEOUT_SECONDS for the first queue item.
-        2. Drain up to BATCH_SIZE items total (non-blocking for extras).
-        3. _flush_batch() — write all rows in one transaction.
-        4. On DB error: rollback, re-queue each payload if _retry_count < MAX_BATCH_RETRIES.
-        5. On shutdown (stop_event): exit only when the queue times out empty.
-        6. Always call task_done() per item and close the DB session.
+        1. BRPOP first item (timeout = BATCH_TIMEOUT_SECONDS).
+        2. RPOP extras non-blocking up to BATCH_SIZE (FIFO drain).
+        3. _flush_batch() once.
+        4. On DB error: re-LPUSH each payload if _retry_count < MAX_BATCH_RETRIES.
+        5. On stop_event + empty: exit.
 
     Reason:
-        Decouples HTTP accept from DB write speed. Batching + timeout balances
-        latency (flush partial batches after 1s) vs throughput (up to 50 payloads).
-        Re-queue handles transient DB outages; max retries prevents infinite loops.
-        Tradeoff: in-memory queue is lost on process crash — Phase 2 adds Kafka/Redis.
+        Same batching idea as Phase 1; only the buffer moved to Redis.
+        Blocking wait for first item, then grab whatever else is ready.
     """
     while True:
-        batch: list[dict] = []
-
-        # Collect up to BATCH_SIZE items, or wait BATCH_TIMEOUT_SECONDS
-        try:
-            first = ingest_queue.get(timeout=BATCH_TIMEOUT_SECONDS)
-            batch.append(first)
-        except Empty:
+        first = dequeue_payload(redis_client, timeout_seconds=BATCH_TIMEOUT_SECONDS)
+        if first is None:
             if stop_event.is_set():
                 break
             continue
 
+        batch: list[dict] = [first]
         while len(batch) < BATCH_SIZE:
-            try:
-                batch.append(ingest_queue.get_nowait())
-            except Empty:
+            item = try_dequeue_nowait(redis_client)
+            if item is None:
                 break
+            batch.append(item)
 
         db = SessionLocal()
         try:
             _flush_batch(db, batch)
         except Exception:
             logger.exception("Failed to persist batch of %s payloads", len(batch))
-
             db.rollback()
 
             for payload in batch:
@@ -134,13 +132,13 @@ def run_ingest_worker(ingest_queue: Queue, stop_event: threading.Event) -> None:
                 if retries < MAX_BATCH_RETRIES:
                     payload["_retry_count"] = retries + 1
                     try:
-                        ingest_queue.put(payload, block=False)
+                        enqueue_payload_retry(redis_client, payload)
                         logger.warning(
                             "Re-queued payload machine=%s retry=%s",
                             payload.get("machine_id"),
                             payload["_retry_count"],
                         )
-                    except Full:
+                    except QueueFullError:
                         logger.error(
                             "Queue full — dropping payload machine=%s after DB failure",
                             payload.get("machine_id"),
@@ -153,5 +151,4 @@ def run_ingest_worker(ingest_queue: Queue, stop_event: threading.Event) -> None:
                     )
         finally:
             db.close()
-            for _ in batch:
-                ingest_queue.task_done()
+            # No task_done() — Redis List has no join semantics

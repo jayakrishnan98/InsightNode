@@ -1,0 +1,10 @@
+ {
+  "event_id": "550e8400-e29b-41d4-a716-446655440000",
+  "machine_id": "load-test-machine",
+  "timestamp": "2026-07-10T10:00:00+00:00",
+  "metrics": [
+    { "name": "cpu_usage", "value": 45.2, "unit": "percent" },
+    { "name": "memory_usage", "value": 62.1, "unit": "percent" },
+    { "name": "disk_usage", "value": 78.0, "unit": "percent" }
+  ]
+}

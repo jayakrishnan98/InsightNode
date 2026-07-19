@@ -2,12 +2,11 @@
 InsightNode API — ingestion and query endpoints for host metrics.
 
 Architecture:
-    Agent --POST /metrics--> Redis List --worker thread--> PostgreSQL
-                              (fast 202)     (durable buffer)   (batched writes)
+    Agent --POST /metrics--> Redis Stream --worker (XREADGROUP)--> PostgreSQL --> XACK
+                              (fast 202)      (PEL until ACK)       (batched writes)
 
-The HTTP handler does not write to the database directly. That decouples accept
-latency from PostgreSQL commit time. Redis keeps buffered payloads across API
-process restarts (Phase 2).
+Redis Streams keep messages until the worker acknowledges after a successful
+DB commit (Phase 2 Day 2).
 """
 
 from datetime import datetime, timezone
@@ -28,7 +27,9 @@ from backend.redis_client import (
     QUEUE_MAX_LENGTH,
     QueueFullError,
     enqueue_payload,
+    ensure_consumer_group,
     get_redis,
+    pending_count,
     ping,
     queue_length,
 )
@@ -67,6 +68,8 @@ async def lifespan(app: FastAPI):
     """
     global worker_thread
 
+    ensure_consumer_group(redis_client)
+
     stop_event.clear()
     worker_thread = threading.Thread(
         target=run_ingest_worker,
@@ -75,7 +78,7 @@ async def lifespan(app: FastAPI):
         daemon=True,
     )
     worker_thread.start()
-    logger.info("Ingest worker started (Redis queue)")
+    logger.info("Ingest worker started (Redis Streams)")
 
     yield
 
@@ -155,9 +158,10 @@ def health_check():
     return {
         "status": "ok",
         "redis_ok": ping(redis_client),
+        "queue_backend": "redis-streams",
         "queue_size": queue_length(redis_client),
         "queue_maxsize": QUEUE_MAX_LENGTH,
-        "queue_backend": "redis",
+        "pending": pending_count(redis_client),
         "worker_alive": worker_thread.is_alive() if worker_thread else False,
     }
 
@@ -227,11 +231,11 @@ def ingest_metrics(payload: MetricsPayload):
     Logic:
         - Validate body via Pydantic (MetricsPayload).
         - Serialize to JSON-safe dict; stamp _retry_count=0 for worker retries.
-        - LPUSH onto Redis list; if at max length, return 503 (backpressure).
+        - XADD onto Redis Stream; if at max length, return 503 (backpressure).
         - Return 202 Accepted with current queue depth.
 
     Reason:
-        Redis survives API restarts (unlike Phase 1 in-memory queue).
+        Stream messages stay until XACK after DB commit (unlike List BRPOP).
         202 means accepted for processing, not yet in PostgreSQL.
     """
     item = payload.model_dump(mode="json")

@@ -1,12 +1,15 @@
 """
 InsightNode API — ingestion and query endpoints for host metrics.
 
-Architecture (Phase 2 Day 3):
+Architecture (Phase 2 Day 4):
     Agent --POST /metrics--> Redis Stream --standalone worker(s)--> PostgreSQL --> XACK
                               (fast 202)     (separate process(es))
+                                                   |
+                                                   +-- poison after N failures --> DLQ stream
 
 The API only accepts and enqueues by default. Run workers with:
   python -m backend.worker
+Poison messages that exceed MAX_DELIVERIES move to insightnode:ingest:dlq.
 """
 
 from datetime import datetime, timezone
@@ -25,11 +28,14 @@ from sqlalchemy.orm import Session
 from backend.database import get_db
 from backend.models import MetricRecord
 from backend.redis_client import (
+    MAX_DELIVERIES,
     QUEUE_MAX_LENGTH,
     QueueFullError,
+    dlq_length,
     enqueue_payload,
     ensure_consumer_group,
     get_redis,
+    peek_dlq,
     pending_count,
     ping,
     queue_length,
@@ -79,7 +85,7 @@ async def lifespan(app: FastAPI):
         worker_thread.join(timeout=5.0)
 
 
-app = FastAPI(title="InsightNode", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.2.1", lifespan=lifespan)
 
 class Metric(BaseModel):
     """Single metric reading inside an ingestion payload (name, value, unit)."""
@@ -138,13 +144,6 @@ class MetricsQueryResponse(BaseModel):
 def health_check():
     """
     Liveness probe and ingest pipeline visibility.
-
-    Logic:
-        - Ping Redis and report list depth + worker thread status.
-
-    Reason:
-        Growing queue_size with redis_ok=true means the worker is falling behind.
-        redis_ok=false means the durable buffer itself is unreachable.
     """
     return {
         "status": "ok",
@@ -153,8 +152,17 @@ def health_check():
         "queue_size": queue_length(redis_client),
         "queue_maxsize": QUEUE_MAX_LENGTH,
         "pending": pending_count(redis_client),
+        "dlq_size": dlq_length(redis_client),
+        "max_deliveries": MAX_DELIVERIES,
         "worker_mode": "embedded" if EMBEDDED_WORKER else "external",
     }
+
+
+@app.get("/dlq")
+def list_dlq(limit: int = Query(20, ge=1, le=100)):
+    """Peek recent dead-letter messages (newest first). Does not delete them."""
+    entries = peek_dlq(redis_client, count=limit)
+    return {"count": len(entries), "entries": entries}
 
 
 @app.get("/metrics", response_model=MetricsQueryResponse)

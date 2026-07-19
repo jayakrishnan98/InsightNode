@@ -1,8 +1,8 @@
 """
 Background worker — drains the Redis Stream and batch-writes to PostgreSQL.
 
-Phase 2 Day 3: runs as a separate process (see __main__), not inside the API.
-Multiple workers share the same consumer group with unique names.
+Phase 2 Day 3: runs as a separate process; multiple workers share one group.
+Phase 2 Day 4: after MAX_DELIVERIES failures, poison messages go to the DLQ.
 """
 
 from __future__ import annotations
@@ -22,10 +22,13 @@ from sqlalchemy.orm import Session
 from backend.database import SessionLocal
 from backend.models import MetricRecord
 from backend.redis_client import (
+    MAX_DELIVERIES,
     ack_messages,
     claim_stale_messages,
     ensure_consumer_group,
+    get_delivery_count,
     get_redis,
+    move_to_dlq,
     read_batch,
 )
 
@@ -33,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 50
 BATCH_TIMEOUT_SECONDS = 1.0
-STALE_IDLE_MS = 60_000
+STALE_IDLE_MS = int(os.getenv("STALE_IDLE_MS", "60000"))
 
 
 def default_consumer_name() -> str:
@@ -79,13 +82,57 @@ def _flush_batch(db: Session, batch: list[dict]) -> None:
     )
 
 
+def _handle_failed_messages(
+    redis_client: Redis,
+    batch_entries: list[tuple[str, dict]],
+    error: Exception,
+) -> None:
+    reason = f"{type(error).__name__}: {error}"
+    for message_id, payload in batch_entries:
+        db = SessionLocal()
+        try:
+            _flush_batch(db, [payload])
+            ack_messages(redis_client, [message_id])
+            logger.info("Recovered message %s on per-item retry", message_id)
+        except Exception as item_error:
+            db.rollback()
+            deliveries = get_delivery_count(redis_client, message_id)
+            if deliveries >= MAX_DELIVERIES:
+                dlq_id = move_to_dlq(
+                    redis_client,
+                    message_id=message_id,
+                    payload=payload,
+                    reason=f"{reason} | last={type(item_error).__name__}: {item_error}",
+                    delivery_count=deliveries,
+                )
+                logger.error(
+                    "Moved poison message %s to DLQ %s after %s deliveries",
+                    message_id,
+                    dlq_id,
+                    deliveries,
+                )
+            else:
+                logger.warning(
+                    "Leaving message %s un-ACK'd (deliveries=%s/%s)",
+                    message_id,
+                    deliveries,
+                    MAX_DELIVERIES,
+                )
+        finally:
+            db.close()
+
+
 def run_ingest_worker(
     redis_client: Redis,
     stop_event: threading.Event,
     consumer_name: str | None = None,
 ) -> None:
     name = consumer_name or default_consumer_name()
-    logger.info("Ingest worker loop starting consumer_name=%s", name)
+    logger.info(
+        "Ingest worker loop starting consumer_name=%s max_deliveries=%s",
+        name,
+        MAX_DELIVERIES,
+    )
 
     while True:
         batch_entries = claim_stale_messages(
@@ -114,12 +161,13 @@ def run_ingest_worker(
         try:
             _flush_batch(db, payloads)
             ack_messages(redis_client, message_ids)
-        except Exception:
+        except Exception as exc:
             logger.exception(
-                "Failed to persist batch of %s messages — leaving un-ACK'd",
+                "Failed to persist batch of %s messages — falling back per-item",
                 len(message_ids),
             )
             db.rollback()
+            _handle_failed_messages(redis_client, batch_entries, exc)
             time.sleep(1)
         finally:
             db.close()

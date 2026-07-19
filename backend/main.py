@@ -1,15 +1,14 @@
 """
 InsightNode API — ingestion and query endpoints for host metrics.
 
-Architecture (Phase 2 Day 4):
-    Agent --POST /metrics--> Redis Stream --standalone worker(s)--> PostgreSQL --> XACK
-                              (fast 202)     (separate process(es))
-                                                   |
-                                                   +-- poison after N failures --> DLQ stream
+Architecture (Phase 2 Day 5):
+    Agent --POST /metrics--> Kafka topic --standalone worker(s)--> PostgreSQL
+                              (fast 202)     (consumer group + manual commit)
+                                                   │
+                                                   └─ poison → Kafka DLQ topic
 
-The API only accepts and enqueues by default. Run workers with:
-  python -m backend.worker
-Poison messages that exceed MAX_DELIVERIES move to insightnode:ingest:dlq.
+Redis Streams (Days 1–4) remain in the repo as learning history (redis_client.py).
+Day 5 moves the live ingest path to Kafka for partitioned, durable log semantics.
 """
 
 from datetime import datetime, timezone
@@ -17,32 +16,32 @@ from typing import Optional, Literal
 
 import logging
 import os
-import threading
-from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Query, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select, func, text
 from sqlalchemy.orm import Session
+from contextlib import asynccontextmanager
 
 from backend.database import get_db
 from backend.models import MetricRecord
-from backend.redis_client import (
+from backend.kafka_client import (
     MAX_DELIVERIES,
     QUEUE_MAX_LENGTH,
     QueueFullError,
-    dlq_length,
+    approximate_lag,
+    dlq_size_estimate,
     enqueue_payload,
-    ensure_consumer_group,
-    get_redis,
+    ensure_topics,
+    get_producer,
     peek_dlq,
-    pending_count,
-    ping,
-    queue_length,
+    ping as kafka_ping,
 )
 
 logger = logging.getLogger(__name__)
-redis_client = get_redis()
+kafka_producer = None  # set in lifespan
+
+# Optional: set EMBEDDED_WORKER=1 to run a worker thread inside the API (dev only).
 EMBEDDED_WORKER = os.getenv("EMBEDDED_WORKER", "0") == "1"
 
 INTERVAL_MAP: dict[str, str] = {
@@ -60,32 +59,60 @@ INTERVAL_MAP: dict[str, str] = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    ensure_consumer_group(redis_client)
+    """
+    API lifespan: ensure Kafka topics + producer; optionally start embedded worker.
+
+    Logic:
+        - ensure_topics() so produce never hits UNKNOWN_TOPIC on first boot.
+        - Create a process-wide KafkaProducer.
+        - If EMBEDDED_WORKER=1, spawn in-process worker thread.
+
+    Reason:
+        Producers should be long-lived (connection reuse). Topics must exist
+        before agents start posting.
+    """
+    global kafka_producer
+
+    ensure_topics()
+    kafka_producer = get_producer()
+    logger.info("Kafka producer ready")
+
     stop_event = None
     worker_thread = None
+
     if EMBEDDED_WORKER:
+        import threading
+
         from backend.worker import run_ingest_worker
 
         stop_event = threading.Event()
         worker_thread = threading.Thread(
             target=run_ingest_worker,
-            args=(redis_client, stop_event),
+            args=(stop_event,),
             name="ingest-worker-embedded",
             daemon=True,
         )
         worker_thread.start()
-        logger.info("Embedded ingest worker started (EMBEDDED_WORKER=1)")
+        logger.info("Embedded Kafka worker started (EMBEDDED_WORKER=1)")
     else:
         logger.info(
-            "API started without embedded worker -- run: python -m backend.worker"
+            "API started without embedded worker — run: python -m backend.worker"
         )
+
     yield
+
     if stop_event is not None and worker_thread is not None:
         stop_event.set()
         worker_thread.join(timeout=5.0)
+        logger.info("Embedded ingest worker stopped")
+
+    if kafka_producer is not None:
+        kafka_producer.flush()
+        kafka_producer.close()
+        kafka_producer = None
 
 
-app = FastAPI(title="InsightNode", version="0.2.1", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.3.0", lifespan=lifespan)
 
 class Metric(BaseModel):
     """Single metric reading inside an ingestion payload (name, value, unit)."""
@@ -144,15 +171,20 @@ class MetricsQueryResponse(BaseModel):
 def health_check():
     """
     Liveness probe and ingest pipeline visibility.
+
+    Logic:
+        - Ping Kafka; report approximate consumer lag and DLQ size.
+
+    Reason:
+        High lag = workers behind. Growing dlq_size = poison payloads parked.
     """
     return {
         "status": "ok",
-        "redis_ok": ping(redis_client),
-        "queue_backend": "redis-streams",
-        "queue_size": queue_length(redis_client),
+        "kafka_ok": kafka_ping(),
+        "queue_backend": "kafka",
+        "queue_size": approximate_lag(),
         "queue_maxsize": QUEUE_MAX_LENGTH,
-        "pending": pending_count(redis_client),
-        "dlq_size": dlq_length(redis_client),
+        "dlq_size": dlq_size_estimate(),
         "max_deliveries": MAX_DELIVERIES,
         "worker_mode": "embedded" if EMBEDDED_WORKER else "external",
     }
@@ -160,8 +192,16 @@ def health_check():
 
 @app.get("/dlq")
 def list_dlq(limit: int = Query(20, ge=1, le=100)):
-    """Peek recent dead-letter messages (newest first). Does not delete them."""
-    entries = peek_dlq(redis_client, count=limit)
+    """
+    Peek recent dead-letter messages from the Kafka DLQ topic.
+
+    Logic:
+        - Seek near end of DLQ partitions and poll up to `limit` messages.
+
+    Reason:
+        Operators need to inspect poison payloads that exceeded MAX_DELIVERIES.
+    """
+    entries = peek_dlq(limit=limit)
     return {"count": len(entries), "entries": entries}
 
 
@@ -225,33 +265,35 @@ def query_metrics(
 @app.post("/metrics", status_code=202)
 def ingest_metrics(payload: MetricsPayload):
     """
-    Accept metrics from agents — enqueue to Redis for async persistence.
+    Accept metrics from agents — produce to Kafka for async persistence.
 
     Logic:
-        - Validate body via Pydantic (MetricsPayload).
-        - Serialize to JSON-safe dict; stamp _retry_count=0 for worker retries.
-        - XADD onto Redis Stream; if at max length, return 503 (backpressure).
-        - Return 202 Accepted with current queue depth.
+        - Validate body via Pydantic.
+        - Produce JSON to insightnode.ingest (key=machine_id).
+        - If lag too high → 503 backpressure.
+        - Return 202 Accepted with approximate lag.
 
     Reason:
-        Stream messages stay until XACK after DB commit (unlike List BRPOP).
-        202 means accepted for processing, not yet in PostgreSQL.
+        API does not write to PostgreSQL. Kafka workers commit offsets after DB
+        success. 202 = accepted for processing, not yet stored.
     """
+    if kafka_producer is None:
+        raise HTTPException(status_code=503, detail="Kafka producer not ready")
+
     item = payload.model_dump(mode="json")
-    item["_retry_count"] = 0
 
     try:
-        enqueue_payload(redis_client, item)
+        enqueue_payload(kafka_producer, item)
     except QueueFullError:
-        logger.warning("Redis ingest queue full — rejecting payload")
+        logger.warning("Kafka ingest lag too high — rejecting payload")
         raise HTTPException(
             status_code=503,
             detail="Ingest queue full, try again later",
         )
 
-    depth = queue_length(redis_client)
+    depth = approximate_lag()
     logger.info(
-        "Enqueued metrics machine=%s metric_count=%s queue_size=%s",
+        "Enqueued metrics machine=%s metric_count=%s lag=%s",
         payload.machine_id,
         len(payload.metrics),
         depth,

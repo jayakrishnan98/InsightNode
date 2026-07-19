@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 1 complete (Days 1–12)**  
-**Next: Phase 2 — Day 13 (Redis durable queue)**
+**Current stage: Phase 2 Day 5 (Kafka ingest bus)**  
+**Previous: Phase 1 complete; Phase 2 Days 1–4 Redis Streams**
 
-Phase 1 uses Python, FastAPI, and PostgreSQL only. No Kafka, Redis, ClickHouse, or Kubernetes yet.
+Phase 2 Day 5 uses **Kafka** (via local Redpanda) for the ingest log. Redis Streams code remains for learning history.
 
 ---
 
@@ -119,7 +119,20 @@ export DATABASE_URL="postgresql://user:password@localhost:5432/insightnode"
 
 Run from the **project root** (`InsightNode/`).
 
-### Start the API
+### Start Kafka (Redpanda — Phase 2 Day 5)
+
+```bash
+docker compose up -d
+# Kafka API on localhost:9092
+```
+
+Install Python deps (includes `kafka-python`):
+
+```bash
+pip install -r requirements.txt
+```
+
+### Start the API (accepts metrics only)
 
 ```bash
 uvicorn backend.main:app --reload --port 8001
@@ -127,9 +140,27 @@ uvicorn backend.main:app --reload --port 8001
 
 API docs: http://127.0.0.1:8001/docs
 
+### Start one or more workers (Kafka consumer group)
+
+```bash
+# Terminal A
+python -m backend.worker
+
+# Terminal B (optional — scales ingest across partitions)
+WORKER_NAME=worker-b python -m backend.worker
+```
+
+Workers share the Kafka consumer group `insightnode-ingest-workers`.
+
+Optional: run a worker inside the API (dev only):
+
+```bash
+EMBEDDED_WORKER=1 uvicorn backend.main:app --reload --port 8001
+```
+
 ### Start the agent
 
-In a second terminal:
+In another terminal:
 
 ```bash
 cd agent
@@ -142,7 +173,17 @@ Expected steady-state output:
 [SENT] 202 → {'status': 'accepted', 'machine_id': '...', 'metric_count': 3, 'queued': 0}
 ```
 
-One line every ~5 seconds.
+Check pipeline health:
+
+```bash
+curl http://127.0.0.1:8001/health
+# queue_backend: kafka, kafka_ok: true, queue_size (lag) near 0
+
+# Inspect poison messages (DLQ topic)
+curl "http://127.0.0.1:8001/dlq?limit=10"
+```
+
+> Note: Redis Streams code (`backend/redis_client.py`) remains as Phase 2 Days 1–4 learning history. Live ingest now uses Kafka.
 
 ---
 

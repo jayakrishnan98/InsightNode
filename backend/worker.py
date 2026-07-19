@@ -1,11 +1,16 @@
 """
 Background worker — drains the Redis Stream and batch-writes to PostgreSQL.
 
-Uses a consumer group: messages stay in the Pending Entries List until XACK
-after a successful DB commit (Phase 2 Day 2).
+Phase 2 Day 3: runs as a separate process (see __main__), not inside the API.
+Multiple workers share the same consumer group with unique names.
 """
 
+from __future__ import annotations
+
 import logging
+import os
+import signal
+import socket
 import threading
 import time
 
@@ -19,6 +24,8 @@ from backend.models import MetricRecord
 from backend.redis_client import (
     ack_messages,
     claim_stale_messages,
+    ensure_consumer_group,
+    get_redis,
     read_batch,
 )
 
@@ -26,8 +33,15 @@ logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 50
 BATCH_TIMEOUT_SECONDS = 1.0
-CONSUMER_NAME = "worker-1"
 STALE_IDLE_MS = 60_000
+
+
+def default_consumer_name() -> str:
+    explicit = os.getenv("WORKER_NAME")
+    if explicit:
+        return explicit
+    host = socket.gethostname().split(".")[0]
+    return f"worker-{host}-{os.getpid()}"
 
 
 def _payload_to_rows(payload: dict) -> list[dict]:
@@ -65,19 +79,25 @@ def _flush_batch(db: Session, batch: list[dict]) -> None:
     )
 
 
-def run_ingest_worker(redis_client: Redis, stop_event: threading.Event) -> None:
-    """Drain Redis Stream via consumer group; ACK only after DB success."""
+def run_ingest_worker(
+    redis_client: Redis,
+    stop_event: threading.Event,
+    consumer_name: str | None = None,
+) -> None:
+    name = consumer_name or default_consumer_name()
+    logger.info("Ingest worker loop starting consumer_name=%s", name)
+
     while True:
         batch_entries = claim_stale_messages(
             redis_client,
-            consumer_name=CONSUMER_NAME,
+            consumer_name=name,
             min_idle_ms=STALE_IDLE_MS,
             count=BATCH_SIZE,
         )
         if not batch_entries:
             batch_entries = read_batch(
                 redis_client,
-                consumer_name=CONSUMER_NAME,
+                consumer_name=name,
                 count=BATCH_SIZE,
                 block_ms=int(BATCH_TIMEOUT_SECONDS * 1000),
             )
@@ -103,3 +123,29 @@ def run_ingest_worker(redis_client: Redis, stop_event: threading.Event) -> None:
             time.sleep(1)
         finally:
             db.close()
+
+    logger.info("Ingest worker loop stopped consumer_name=%s", name)
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    redis_client = get_redis()
+    ensure_consumer_group(redis_client)
+    stop_event = threading.Event()
+    consumer_name = default_consumer_name()
+
+    def _handle_signal(signum: int, _frame: object) -> None:
+        logger.info("Received signal %s — shutting down worker", signum)
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    logger.info("Standalone worker starting consumer_name=%s", consumer_name)
+    run_ingest_worker(redis_client, stop_event, consumer_name=consumer_name)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,18 +1,19 @@
 """
 InsightNode API — ingestion and query endpoints for host metrics.
 
-Architecture:
-    Agent --POST /metrics--> Redis Stream --worker (XREADGROUP)--> PostgreSQL --> XACK
-                              (fast 202)      (PEL until ACK)       (batched writes)
+Architecture (Phase 2 Day 3):
+    Agent --POST /metrics--> Redis Stream --standalone worker(s)--> PostgreSQL --> XACK
+                              (fast 202)     (separate process(es))
 
-Redis Streams keep messages until the worker acknowledges after a successful
-DB commit (Phase 2 Day 2).
+The API only accepts and enqueues by default. Run workers with:
+  python -m backend.worker
 """
 
 from datetime import datetime, timezone
 from typing import Optional, Literal
 
 import logging
+import os
 import threading
 from contextlib import asynccontextmanager
 
@@ -33,12 +34,10 @@ from backend.redis_client import (
     ping,
     queue_length,
 )
-from backend.worker import run_ingest_worker
 
 logger = logging.getLogger(__name__)
 redis_client = get_redis()
-stop_event = threading.Event()
-worker_thread: threading.Thread | None = None
+EMBEDDED_WORKER = os.getenv("EMBEDDED_WORKER", "0") == "1"
 
 INTERVAL_MAP: dict[str, str] = {
     "1m": "1 minute",
@@ -55,40 +54,32 @@ INTERVAL_MAP: dict[str, str] = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Start and stop the Redis-backed ingest worker with the FastAPI application.
-
-    Logic:
-        - On startup: clear stop_event, spawn worker thread with redis_client.
-        - yield — app serves traffic while the worker drains Redis.
-        - On shutdown: set stop_event, join the worker (up to 5s).
-
-    Reason:
-        Worker must share the same Redis list as POST /metrics handlers.
-    """
-    global worker_thread
-
     ensure_consumer_group(redis_client)
+    stop_event = None
+    worker_thread = None
+    if EMBEDDED_WORKER:
+        from backend.worker import run_ingest_worker
 
-    stop_event.clear()
-    worker_thread = threading.Thread(
-        target=run_ingest_worker,
-        args=(redis_client, stop_event),
-        name="ingest-worker",
-        daemon=True,
-    )
-    worker_thread.start()
-    logger.info("Ingest worker started (Redis Streams)")
-
+        stop_event = threading.Event()
+        worker_thread = threading.Thread(
+            target=run_ingest_worker,
+            args=(redis_client, stop_event),
+            name="ingest-worker-embedded",
+            daemon=True,
+        )
+        worker_thread.start()
+        logger.info("Embedded ingest worker started (EMBEDDED_WORKER=1)")
+    else:
+        logger.info(
+            "API started without embedded worker -- run: python -m backend.worker"
+        )
     yield
-
-    stop_event.set()
-    if worker_thread is not None:
+    if stop_event is not None and worker_thread is not None:
+        stop_event.set()
         worker_thread.join(timeout=5.0)
-        logger.info("Ingest worker stopped")
 
 
-app = FastAPI(title="InsightNode", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.2.0", lifespan=lifespan)
 
 class Metric(BaseModel):
     """Single metric reading inside an ingestion payload (name, value, unit)."""
@@ -162,7 +153,7 @@ def health_check():
         "queue_size": queue_length(redis_client),
         "queue_maxsize": QUEUE_MAX_LENGTH,
         "pending": pending_count(redis_client),
-        "worker_alive": worker_thread.is_alive() if worker_thread else False,
+        "worker_mode": "embedded" if EMBEDDED_WORKER else "external",
     }
 
 

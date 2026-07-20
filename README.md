@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 2 Day 5 (Kafka ingest bus)**  
-**Previous: Phase 1 complete; Phase 2 Days 1–4 Redis Streams**
+**Current stage: Phase 2 complete (Day 6)**  
+**Next: Phase 3 — ClickHouse (time-series storage)**
 
-Phase 2 Day 5 uses **Kafka** (via local Redpanda) for the ingest log. Redis Streams code remains for learning history.
+Phase 2 delivers a durable Kafka ingest bus with standalone workers, DLQ, rate limits, and pipeline observability. Redis Streams code remains as Days 1–4 learning history.
 
 ---
 
@@ -17,27 +17,27 @@ InsightNode collects host metrics (CPU, memory, disk) from a local agent, ingest
 Agent (psutil + spool)
     │  POST /metrics {event_id, ...}
     ▼
-FastAPI ──enqueue──► In-memory Queue ──worker──► PostgreSQL
-  │ 202 fast              (buffer)         (batch + dedup)
-  │
-  ├── GET /metrics           (raw points)
-  ├── GET /metrics/aggregate (avg/min/max buckets)
-  └── GET /health            (queue + worker status)
+FastAPI (rate limit) ──produce──► Kafka ──workers──► PostgreSQL
+  │ 202 / 429 / 503                 │
+  ├── GET /metrics                  └─ DLQ topic
+  ├── GET /metrics/aggregate
+  ├── GET /health
+  ├── GET /pipeline          (per-partition lag)
+  └── GET /dlq
 ```
 
-### Features (Phase 1)
+### Features (Phase 1 + Phase 2)
 
 | Component | Capability |
 |-----------|------------|
 | **Agent** | Collects CPU, memory, and disk gauges every 5 seconds |
-| **Ingestion API** | Validates payloads with Pydantic, enqueues for async processing |
-| **Background worker** | Batch-writes to PostgreSQL (up to 50 payloads per commit) |
-| **Query API** | Filter raw points by `machine_id`, `metric_name`, time range |
-| **Aggregation API** | Time-bucketed avg, min, max, sample_count |
-| **Idempotency** | `event_id` per payload + dedup on insert |
-| **Health endpoint** | Queue depth, worker status |
-| **Agent resilience** | Exponential backoff retries + on-disk spool when API is down |
-| **Worker resilience** | Re-queues failed batches (up to 3 attempts) |
+| **Ingestion API** | Validates payloads, rate-limits, produces to Kafka |
+| **Kafka bus** | Partitioned ingest + DLQ; idempotent producer |
+| **Workers** | Standalone consumers; commit offsets after DB write |
+| **Query API** | Raw points + time-bucket aggregations |
+| **Idempotency** | `event_id` unique index in PostgreSQL |
+| **Ops** | `/health`, `/pipeline` (partition lag), `/dlq` |
+| **Agent resilience** | Retries + on-disk spool |
 
 ---
 
@@ -46,24 +46,25 @@ FastAPI ──enqueue──► In-memory Queue ──worker──► PostgreSQL
 ```
 InsightNode/
 ├── agent/
-│   ├── main.py          # Telemetry agent — collect, send, replay spool
-│   ├── spool.py         # NDJSON disk buffer for failed payloads
-│   └── data/            # Runtime spool file (gitignored)
+│   ├── main.py
+│   ├── spool.py
+│   └── data/
 ├── backend/
-│   ├── main.py          # FastAPI app — ingest, query, aggregate, health
-│   ├── worker.py        # Background consumer — queue → PostgreSQL
-│   ├── database.py      # SQLAlchemy engine and session setup
-│   └── models.py        # MetricRecord ORM model
+│   ├── main.py              # FastAPI — ingest, query, pipeline, dlq
+│   ├── worker.py            # Kafka consumer → PostgreSQL
+│   ├── kafka_client.py      # Phase 2 Day 5–6 Kafka helpers
+│   ├── rate_limit.py        # Phase 2 Day 6 ingest rate limit
+│   ├── redis_client.py      # Phase 2 Days 1–4 (history)
+│   ├── database.py
+│   └── models.py
 ├── docs/
 │   ├── architecture.md
-│   ├── request-flows.md
-│   ├── database-schema.md
-│   ├── bottlenecks-and-roadmap.md
-│   └── phase-1-graduation.md
+│   ├── phase-1-graduation.md
+│   ├── phase-2-architecture.md
+│   ├── phase-2-graduation.md
+│   └── ...
+├── docker-compose.yml       # Redpanda (Kafka API :9092)
 ├── sql/
-│   ├── schema.sql
-│   └── migrations/
-│       └── 001_add_event_id.sql
 └── requirements.txt
 ```
 
@@ -179,11 +180,15 @@ Check pipeline health:
 curl http://127.0.0.1:8001/health
 # queue_backend: kafka, kafka_ok: true, queue_size (lag) near 0
 
+# Per-partition lag (Phase 2 Day 6)
+curl http://127.0.0.1:8001/pipeline
+
 # Inspect poison messages (DLQ topic)
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
-> Note: Redis Streams code (`backend/redis_client.py`) remains as Phase 2 Days 1–4 learning history. Live ingest now uses Kafka.
+> See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).
+> Redis Streams code (`backend/redis_client.py`) remains as Days 1–4 learning history.
 
 ---
 

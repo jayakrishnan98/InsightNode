@@ -76,19 +76,22 @@ def ensure_topics() -> None:
 
 def get_producer() -> KafkaProducer:
     """
-    Shared Kafka producer for the API.
+    Shared Kafka producer for the API (Phase 2 Day 6: idempotent).
 
     Logic:
-        - JSON value serializer; key = machine_id for per-host partition affinity.
-        - acks=all for durability of produce.
+        - JSON serializers; key = machine_id for per-host partition affinity.
+        - acks=all + enable_idempotence=True + retries.
+        - linger_ms batches tiny produces without hurting agent latency much.
 
     Reason:
-        Same machine's metrics land on one partition → ordered per host.
+        Idempotent producer prevents duplicate Kafka records if the broker
+        acks late and the client retries — complements event_id at the DB layer.
     """
     return KafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP,
         acks="all",
-        retries=3,
+        retries=5,
+        enable_idempotence=True,
         linger_ms=5,
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         key_serializer=lambda k: k.encode("utf-8") if k is not None else None,
@@ -164,18 +167,26 @@ def publish_dlq(
 
 
 def approximate_lag() -> int:
+    """Total consumer-group lag across all ingest partitions."""
+    details = partition_lag_details()
+    return int(sum(p["lag"] for p in details.get("partitions", [])))
+
+
+def partition_lag_details() -> dict[str, Any]:
     """
-    Rough total consumer-group lag across ingest partitions.
+    Per-partition lag for the ingest consumer group (Phase 2 Day 6).
 
     Logic:
-        - Temporary consumer in the worker group; compare end offsets vs committed.
-        - Sum (highwatermark - committed) per partition.
+        - For each partition: beginning, committed, end offsets.
+        - lag = end - committed (or end - beginning if never committed).
 
     Reason:
-        Used for /health and soft produce backpressure. Not exact under all
-        edge cases — good enough for Day 5 learning.
+        Total lag hides hot partitions. Ops need per-partition views when
+        one machine_id key hashes to a busy partition.
     """
     try:
+        from kafka import TopicPartition
+
         consumer = KafkaConsumer(
             bootstrap_servers=KAFKA_BOOTSTRAP,
             group_id=CONSUMER_GROUP,
@@ -184,29 +195,56 @@ def approximate_lag() -> int:
         partitions = consumer.partitions_for_topic(INGEST_TOPIC) or set()
         if not partitions:
             consumer.close()
-            return 0
+            return {
+                "topic": INGEST_TOPIC,
+                "group": CONSUMER_GROUP,
+                "total_lag": 0,
+                "partitions": [],
+            }
 
-        from kafka import TopicPartition
-
-        tps = [TopicPartition(INGEST_TOPIC, p) for p in partitions]
+        tps = [TopicPartition(INGEST_TOPIC, p) for p in sorted(partitions)]
         consumer.assign(tps)
+        beginning = consumer.beginning_offsets(tps)
         end_offsets = consumer.end_offsets(tps)
-        lag = 0
+
+        rows: list[dict[str, Any]] = []
+        total = 0
         for tp in tps:
             committed = consumer.committed(tp)
+            begin = beginning.get(tp, 0)
             end = end_offsets.get(tp, 0)
             if committed is None:
-                # No commit yet — treat full end offset as lag
-                beginning = consumer.beginning_offsets([tp]).get(tp, 0)
-                lag += max(0, end - beginning)
+                lag = max(0, end - begin)
+                committed_offset = None
             else:
-                lag += max(0, end - committed)
+                lag = max(0, end - committed)
+                committed_offset = committed
+            total += lag
+            rows.append(
+                {
+                    "partition": tp.partition,
+                    "beginning": begin,
+                    "committed": committed_offset,
+                    "end": end,
+                    "lag": lag,
+                }
+            )
         consumer.close()
-        return int(lag)
+        return {
+            "topic": INGEST_TOPIC,
+            "group": CONSUMER_GROUP,
+            "total_lag": total,
+            "partitions": rows,
+        }
     except Exception:
-        logger.exception("Failed to compute Kafka lag")
-        return 0
-
+        logger.exception("Failed to compute partition lag details")
+        return {
+            "topic": INGEST_TOPIC,
+            "group": CONSUMER_GROUP,
+            "total_lag": 0,
+            "partitions": [],
+            "error": "unavailable",
+        }
 
 def dlq_size_estimate() -> int:
     """Estimate messages currently in the DLQ topic (end - beginning)."""

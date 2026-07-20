@@ -1,14 +1,14 @@
 """
 InsightNode API — ingestion and query endpoints for host metrics.
 
-Architecture (Phase 2 Day 5):
+Architecture (Phase 2 Day 6 — Phase 2 complete):
     Agent --POST /metrics--> Kafka topic --standalone worker(s)--> PostgreSQL
-                              (fast 202)     (consumer group + manual commit)
+                              (202 + rate limit)  (consumer group + manual commit)
                                                    │
                                                    └─ poison → Kafka DLQ topic
 
-Redis Streams (Days 1–4) remain in the repo as learning history (redis_client.py).
-Day 5 moves the live ingest path to Kafka for partitioned, durable log semantics.
+Day 6 adds: idempotent producer, per-partition lag (/pipeline), ingest rate limits.
+Redis Streams (Days 1–4) remain as learning history (redis_client.py).
 """
 
 from datetime import datetime, timezone
@@ -34,8 +34,14 @@ from backend.kafka_client import (
     enqueue_payload,
     ensure_topics,
     get_producer,
+    partition_lag_details,
     peek_dlq,
     ping as kafka_ping,
+)
+from backend.rate_limit import (
+    RATE_LIMIT_MAX,
+    RATE_LIMIT_WINDOW_SECONDS,
+    ingest_rate_limiter,
 )
 
 logger = logging.getLogger(__name__)
@@ -112,7 +118,7 @@ async def lifespan(app: FastAPI):
         kafka_producer = None
 
 
-app = FastAPI(title="InsightNode", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.3.1", lifespan=lifespan)
 
 class Metric(BaseModel):
     """Single metric reading inside an ingestion payload (name, value, unit)."""
@@ -177,6 +183,7 @@ def health_check():
 
     Reason:
         High lag = workers behind. Growing dlq_size = poison payloads parked.
+        Use GET /pipeline for per-partition detail (Day 6).
     """
     return {
         "status": "ok",
@@ -186,6 +193,36 @@ def health_check():
         "queue_maxsize": QUEUE_MAX_LENGTH,
         "dlq_size": dlq_size_estimate(),
         "max_deliveries": MAX_DELIVERIES,
+        "rate_limit_max": RATE_LIMIT_MAX,
+        "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
+        "worker_mode": "embedded" if EMBEDDED_WORKER else "external",
+    }
+
+
+@app.get("/pipeline")
+def pipeline_status():
+    """
+    Per-partition Kafka lag and pipeline summary (Phase 2 Day 6).
+
+    Logic:
+        - partition_lag_details() for each ingest partition.
+        - Include DLQ size and rate-limit config.
+
+    Reason:
+        Total lag hides hot partitions. When one machine_id hashes heavily to
+        one partition, only that partition's lag spikes — this endpoint shows it.
+    """
+    lag = partition_lag_details()
+    return {
+        "kafka_ok": kafka_ping(),
+        "ingest": lag,
+        "dlq_size": dlq_size_estimate(),
+        "backpressure_max_lag": QUEUE_MAX_LENGTH,
+        "max_deliveries": MAX_DELIVERIES,
+        "rate_limit": {
+            "max": RATE_LIMIT_MAX,
+            "window_seconds": RATE_LIMIT_WINDOW_SECONDS,
+        },
         "worker_mode": "embedded" if EMBEDDED_WORKER else "external",
     }
 
@@ -269,16 +306,28 @@ def ingest_metrics(payload: MetricsPayload):
 
     Logic:
         - Validate body via Pydantic.
+        - Per-machine_id rate limit (Day 6) → 429 if exceeded.
         - Produce JSON to insightnode.ingest (key=machine_id).
         - If lag too high → 503 backpressure.
         - Return 202 Accepted with approximate lag.
 
     Reason:
-        API does not write to PostgreSQL. Kafka workers commit offsets after DB
-        success. 202 = accepted for processing, not yet stored.
+        Rate limit protects the pipeline from a runaway agent.
+        Lag-based 503 protects when workers fall behind.
+        202 = accepted for processing, not yet stored.
     """
     if kafka_producer is None:
         raise HTTPException(status_code=503, detail="Kafka producer not ready")
+
+    if not ingest_rate_limiter.allow(payload.machine_id):
+        logger.warning("Rate limit exceeded machine=%s", payload.machine_id)
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Rate limit exceeded: max {RATE_LIMIT_MAX} requests "
+                f"per {RATE_LIMIT_WINDOW_SECONDS:.0f}s for this machine_id"
+            ),
+        )
 
     item = payload.model_dump(mode="json")
 

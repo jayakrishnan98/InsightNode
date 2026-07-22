@@ -1,14 +1,13 @@
 """
 InsightNode API — ingestion and query endpoints for host metrics.
 
-Architecture (Phase 3 Day 1):
-    Agent --POST /metrics--> Kafka topic --standalone worker(s)--> PostgreSQL
-                              (202 + rate limit)  (consumer group + manual commit)
-                                                   │
+Architecture (Phase 3 Day 2):
+    Agent --POST /metrics--> Kafka topic --standalone worker(s)--+--> PostgreSQL
+                              (202 + rate limit)  (consumer group) |
+                                                   │               +--> ClickHouse
                                                    └─ poison → Kafka DLQ topic
 
-    ClickHouse is up (schema + health ping). Dual-write lands in Day 2;
-    aggregate query routing lands in Day 3.
+    Day 2: dual-write after Kafka consume. Aggregate queries still hit PG (Day 3).
 """
 
 from datetime import datetime, timezone

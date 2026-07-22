@@ -1,9 +1,13 @@
 """
-Background worker — drains Kafka ingest topic and batch-writes to PostgreSQL.
+Background worker — drains Kafka ingest topic and dual-writes storage.
 
-Phase 2 Day 5: Kafka consumer group replaces Redis Streams.
-  - Manual offset commit after successful DB write (ACK-after-commit).
-  - Poison messages after MAX_DELIVERIES → DLQ topic.
+Phase 2: Kafka consumer group, ACK-after-commit, DLQ for poison messages.
+Phase 3 Day 2: each successful batch also inserts into ClickHouse.
+
+Commit order (learning rule):
+  1. PostgreSQL (idempotent via event_id unique index)
+  2. ClickHouse (append-only; may duplicate on rare redelivery)
+  3. Kafka offset commit only after both writes succeed
 """
 
 from __future__ import annotations
@@ -21,6 +25,11 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from backend.clickhouse_client import (
+    close_client as close_clickhouse,
+    ensure_schema as ensure_clickhouse_schema,
+    insert_metrics as insert_clickhouse_metrics,
+)
 from backend.database import SessionLocal
 from backend.kafka_client import (
     CONSUMER_GROUP,
@@ -64,7 +73,21 @@ def _payload_to_rows(payload: dict) -> list[dict]:
 
 
 def _flush_batch(db: Session, batch: list[dict]) -> None:
-    """Idempotent batch insert into PostgreSQL."""
+    """
+    Dual-write one batch: PostgreSQL then ClickHouse.
+
+    Logic:
+        - Expand payloads → row dicts.
+        - Idempotent INSERT into PostgreSQL (ON CONFLICT DO NOTHING).
+        - Append the same rows into ClickHouse.
+        - Caller commits Kafka offsets only if this returns without error.
+
+    Reason:
+        PG first keeps the deduped source of truth. If CH fails, the offset is
+        not committed and Kafka redelivers; PG ignores duplicates, CH retries.
+        If both succeed but offset commit fails, CH may see duplicates — Day 2
+        accepts that until ReplacingMergeTree / stronger dedup.
+    """
     rows: list[dict] = []
     for payload in batch:
         rows.extend(_payload_to_rows(payload))
@@ -80,8 +103,10 @@ def _flush_batch(db: Session, batch: list[dict]) -> None:
     result = db.execute(stmt)
     db.commit()
 
+    insert_clickhouse_metrics(rows)
+
     logger.info(
-        "Persisted batch: %s row(s) submitted, %s new (rest were duplicates)",
+        "Persisted batch: %s row(s) submitted, %s new in PG (+ ClickHouse)",
         len(rows),
         result.rowcount,
     )
@@ -113,7 +138,7 @@ def _handle_failed_messages(
     Per-message recovery after a batch failure.
 
     Logic:
-        - Try each message alone.
+        - Try each message alone (same dual-write path).
         - Success → commit that message's offset.
         - Fail: increment in-memory fail_counts[event_id].
           If >= MAX_DELIVERIES → DLQ + commit (stop retrying).
@@ -165,64 +190,67 @@ def run_ingest_worker(
     consumer_name: str | None = None,
 ) -> None:
     """
-    Poll Kafka ingest topic; commit offsets only after DB success.
+    Poll Kafka ingest topic; commit offsets only after dual-write success.
 
     Logic:
         1. poll() up to BATCH_SIZE records.
-        2. Flush payloads to PostgreSQL.
+        2. Flush payloads to PostgreSQL + ClickHouse.
         3. On success → commit offsets.
         4. On failure → per-message retry / DLQ.
         5. Exit when stop_event set and idle.
     """
     name = consumer_name or default_consumer_name()
+    ensure_clickhouse_schema()
     consumer = get_consumer(group_id=CONSUMER_GROUP)
     producer = get_producer()
     fail_counts: dict[str, int] = defaultdict(int)
 
     logger.info(
-        "Kafka ingest worker starting name=%s group=%s max_deliveries=%s",
+        "Kafka ingest worker starting name=%s group=%s max_deliveries=%s dual_write=pg+ch",
         name,
         CONSUMER_GROUP,
         MAX_DELIVERIES,
     )
 
-    while True:
-        records = consumer.poll(
-            timeout_ms=POLL_TIMEOUT_MS,
-            max_records=BATCH_SIZE,
-        )
-
-        messages: list = []
-        for _tp, msgs in records.items():
-            messages.extend(msgs)
-
-        if not messages:
-            if stop_event.is_set():
-                break
-            continue
-
-        payloads = [m.value for m in messages]
-        db = SessionLocal()
-        try:
-            _flush_batch(db, payloads)
-            _commit_messages(consumer, messages)
-            for m in messages:
-                eid = str(m.value.get("event_id", ""))
-                fail_counts.pop(eid, None)
-        except Exception as exc:
-            logger.exception(
-                "Failed to persist batch of %s messages — falling back per-item",
-                len(messages),
+    try:
+        while True:
+            records = consumer.poll(
+                timeout_ms=POLL_TIMEOUT_MS,
+                max_records=BATCH_SIZE,
             )
-            db.rollback()
-            _handle_failed_messages(consumer, producer, messages, exc, fail_counts)
-            time.sleep(1)
-        finally:
-            db.close()
 
-    consumer.close()
-    producer.close()
-    logger.info("Kafka ingest worker stopped name=%s", name)
+            messages: list = []
+            for _tp, msgs in records.items():
+                messages.extend(msgs)
+
+            if not messages:
+                if stop_event.is_set():
+                    break
+                continue
+
+            payloads = [m.value for m in messages]
+            db = SessionLocal()
+            try:
+                _flush_batch(db, payloads)
+                _commit_messages(consumer, messages)
+                for m in messages:
+                    eid = str(m.value.get("event_id", ""))
+                    fail_counts.pop(eid, None)
+            except Exception as exc:
+                logger.exception(
+                    "Failed to persist batch of %s messages — falling back per-item",
+                    len(messages),
+                )
+                db.rollback()
+                _handle_failed_messages(consumer, producer, messages, exc, fail_counts)
+                time.sleep(1)
+            finally:
+                db.close()
+    finally:
+        consumer.close()
+        producer.close()
+        close_clickhouse()
+        logger.info("Kafka ingest worker stopped name=%s", name)
 
 
 def main() -> None:

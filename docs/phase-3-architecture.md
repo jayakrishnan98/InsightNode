@@ -4,8 +4,8 @@ Phase 3 adds a columnar time-series store for analytical queries, while keeping 
 
 ```
 Phase 2:  Agent → API → Kafka → worker → PostgreSQL
-Day 1:    + ClickHouse up (schema + health)           ← YOU ARE HERE
-Day 2:    worker dual-writes → PostgreSQL + ClickHouse
+Day 1:    + ClickHouse up (schema + health)
+Day 2:    worker dual-writes → PostgreSQL + ClickHouse   ← YOU ARE HERE
 Day 3:    GET /metrics/aggregate reads from ClickHouse
 Day 4:    Compare PostgreSQL vs ClickHouse at scale
 Day 5:    Docs + graduation
@@ -13,7 +13,7 @@ Day 5:    Docs + graduation
 
 ---
 
-## Current architecture (Day 1)
+## Current architecture (Day 2)
 
 ```mermaid
 flowchart LR
@@ -22,16 +22,36 @@ flowchart LR
   API -->|produce| K[(Kafka)]
   K --> W[workers]
   W --> PG[(PostgreSQL)]
-  W -.->|Day 2| CH[(ClickHouse)]
-  API -->|GET /health clickhouse_ok| CH
+  W --> CH[(ClickHouse)]
+  API -->|GET /metrics raw| PG
+  API -->|GET /metrics/aggregate| PG
+  API -->|GET /health| CH
 ```
 
-| Layer | Technology | Day 1 status |
+| Layer | Technology | Day 2 status |
 |-------|------------|--------------|
 | Ingest bus | Kafka (Redpanda) | Unchanged from Phase 2 |
-| Row store | PostgreSQL | Still the only write target |
-| Columnar store | ClickHouse | Running; empty until Day 2 |
+| Row store | PostgreSQL | Idempotent writes (`event_id`) |
+| Columnar store | ClickHouse | Dual-written from the same worker batch |
 | Aggregate API | PostgreSQL `GROUP BY` | Still PG until Day 3 |
+
+---
+
+## Dual-write commit order
+
+```
+1. INSERT PostgreSQL  (ON CONFLICT DO NOTHING)
+2. INSERT ClickHouse  (append)
+3. Kafka offset commit
+```
+
+| Failure | What happens |
+|---------|----------------|
+| PG fails | Offset not committed → Kafka redelivers |
+| PG ok, CH fails | Offset not committed → redeliver; PG dedupes; CH retries |
+| Both ok, offset commit fails | Redeliver → PG dedupes; **CH may duplicate** (accepted Day 2) |
+
+PostgreSQL remains the deduped source of truth. ClickHouse may see rare duplicates under at-least-once delivery until `ReplacingMergeTree` / stronger dedup later.
 
 ---
 
@@ -42,9 +62,7 @@ flowchart LR
 | Write pattern | Good OLTP / mixed | Append-heavy metrics |
 | `AVG/MIN/MAX` over millions of rows | Scans whole rows | Reads mostly the `value` column |
 | Time-range drops | `DELETE` is expensive | Drop partitions by month |
-| Dedup | Unique index on `event_id` | No unique constraint on Day 1 — PG still owns idempotency |
-
-Day 1 deliberately does **not** dual-write yet. First prove the store is up and the schema matches how you query.
+| Dedup | Unique index on `event_id` | No unique constraint yet |
 
 ---
 
@@ -57,22 +75,25 @@ Source: [`sql/clickhouse/schema.sql`](../sql/clickhouse/schema.sql)
 | Engine | `MergeTree` | Append-oriented columnar default |
 | `PARTITION BY` | `toYYYYMM(timestamp)` | Cheap time-range pruning / retention later |
 | `ORDER BY` | `(machine_id, metric_name, timestamp)` | Matches aggregate filter pattern |
-| Idempotency | None in CH yet | PG unique index remains source of truth for Day 2 |
+| Idempotency | None in CH yet | PG unique index remains source of truth |
 
 ---
 
 ## Local ops
 
 ```bash
-# Start Redpanda + ClickHouse
 docker compose up -d
+uvicorn backend.main:app --reload --port 8001
+python -m backend.worker
 
-# HTTP ping
-curl http://localhost:8123/ping
-
-# After API start — schema ensured in lifespan
+# Health
 curl http://127.0.0.1:8001/health
-# expect clickhouse_ok: true
+# expect kafka_ok + clickhouse_ok true
+
+# After the agent runs, count CH rows:
+docker exec -it insightnode-clickhouse clickhouse-client \
+  --user insightnode --password insightnode \
+  -q "SELECT count() FROM insightnode.metrics"
 ```
 
 Env overrides (optional):
@@ -87,9 +108,8 @@ Env overrides (optional):
 
 ---
 
-## What Day 1 deliberately does not include
+## What Day 2 deliberately does not include
 
-- Worker inserts into ClickHouse → **Day 2**
 - Routing `/metrics/aggregate` to ClickHouse → **Day 3**
 - `ReplacingMergeTree` / CH-side dedup → later if needed
 - Removing PostgreSQL → not this phase (dual-write keeps the comparison)

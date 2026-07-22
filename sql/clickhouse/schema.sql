@@ -24,5 +24,5 @@ SETTINGS index_granularity = 8192;
 --   - PARTITION BY month keeps time-range scans cheap to drop old data later.
 --   - ORDER BY matches our query pattern: host + metric + time.
 --   - No unique constraint here — PostgreSQL still owns idempotency (event_id).
---     Day 2 dual-write will insert into both stores; CH may see duplicates under
+--     Day 2 dual-write inserts into both stores; CH may see duplicates under
 --     at-least-once delivery until we add ReplacingMergeTree / dedup later.

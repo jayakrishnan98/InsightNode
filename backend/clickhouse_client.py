@@ -1,16 +1,19 @@
 """
-ClickHouse client for Phase 3 Day 1.
+ClickHouse client for Phase 3.
 
-Day 1 only: connect, ensure schema, health ping.
-Dual-write from the Kafka worker lands in Day 2.
-Aggregate query routing lands in Day 3.
+Day 1: connect, ensure schema, health ping.
+Day 2: insert_metrics() for worker dual-write.
+Day 3: aggregate query routing (not yet).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+from uuid import UUID
 
 import clickhouse_connect
 from clickhouse_connect.driver.client import Client
@@ -23,7 +26,17 @@ CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "insightnode")
 CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "insightnode")
 CLICKHOUSE_DATABASE = os.getenv("CLICKHOUSE_DATABASE", "insightnode")
 
+METRICS_TABLE = f"{CLICKHOUSE_DATABASE}.metrics"
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "sql" / "clickhouse" / "schema.sql"
+
+COLUMN_NAMES = [
+    "machine_id",
+    "metric_name",
+    "value",
+    "unit",
+    "timestamp",
+    "event_id",
+]
 
 _client: Client | None = None
 
@@ -34,7 +47,7 @@ def get_client() -> Client:
 
     Logic:
         - Lazy-create one client on first use (reuse TCP/HTTP connections).
-        - Connect to the default DB first; ensure_schema() creates insightnode.
+        - Connect without a default DB; DDL/DML use fully qualified names.
 
     Reason:
         clickhouse-connect is designed for long-lived clients. Creating one per
@@ -106,8 +119,67 @@ def ensure_schema() -> None:
     )
 
 
+def _as_utc_datetime(value: Any) -> datetime:
+    """Normalize ISO strings / datetimes to timezone-aware UTC for DateTime64."""
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    else:
+        raise TypeError(f"Unsupported timestamp type: {type(value)!r}")
+
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _as_uuid_or_none(value: Any) -> UUID | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, UUID):
+        return value
+    return UUID(str(value))
+
+
+def insert_metrics(rows: list[dict[str, Any]]) -> None:
+    """
+    Batch-insert metric rows into ClickHouse (Phase 3 Day 2).
+
+    Logic:
+        - Map the same row dicts the worker uses for PostgreSQL.
+        - Normalize timestamp / event_id types for DateTime64 + Nullable(UUID).
+        - client.insert() one batch (created_at uses table DEFAULT).
+
+    Reason:
+        Dual-write keeps PG as the idempotent row store and CH as the analytics
+        copy. ClickHouse has no unique constraint yet — at-least-once redelivery
+        after a successful CH insert can create duplicate rows (accepted for Day 2).
+    """
+    if not rows:
+        return
+
+    data = [
+        [
+            row["machine_id"],
+            row["metric_name"],
+            float(row["value"]),
+            row["unit"],
+            _as_utc_datetime(row["timestamp"]),
+            _as_uuid_or_none(row.get("event_id")),
+        ]
+        for row in rows
+    ]
+
+    get_client().insert(
+        METRICS_TABLE,
+        data,
+        column_names=COLUMN_NAMES,
+    )
+    logger.info("ClickHouse insert: %s row(s) into %s", len(data), METRICS_TABLE)
+
+
 def close_client() -> None:
-    """Close the shared client (API shutdown)."""
+    """Close the shared client (API / worker shutdown)."""
     global _client
     if _client is not None:
         _client.close()

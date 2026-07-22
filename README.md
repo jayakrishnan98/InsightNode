@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 3 Day 1 — ClickHouse up**  
-**Next: Phase 3 Day 2 — dual-write (PostgreSQL + ClickHouse)**
+**Current stage: Phase 3 Day 2 — dual-write (PostgreSQL + ClickHouse)**  
+**Next: Phase 3 Day 3 — route `/metrics/aggregate` to ClickHouse**
 
-Phase 2 delivers a durable Kafka ingest bus with standalone workers, DLQ, rate limits, and pipeline observability. Phase 3 Day 1 adds ClickHouse (schema + health); workers still write only to PostgreSQL until Day 2.
+Phase 2 delivers a durable Kafka ingest bus. Phase 3 Day 2 dual-writes each consumed batch to PostgreSQL (idempotent) and ClickHouse (analytics copy). Aggregate queries still hit PostgreSQL until Day 3.
 
 ---
 
@@ -18,14 +18,12 @@ Agent (psutil + spool)
     │  POST /metrics {event_id, ...}
     ▼
 FastAPI (rate limit) ──produce──► Kafka ──workers──► PostgreSQL
-  │ 202 / 429 / 503                 │
+  │ 202 / 429 / 503                 │            └─► ClickHouse (Day 2)
   ├── GET /metrics                  └─ DLQ topic
   ├── GET /metrics/aggregate          (still PG until Day 3)
   ├── GET /health          (+ clickhouse_ok)
   ├── GET /pipeline
   └── GET /dlq
-
-ClickHouse (Day 1): running + schema; dual-write starts Day 2
 ```
 
 ### Features (Phase 1 + Phase 2)
@@ -35,12 +33,12 @@ ClickHouse (Day 1): running + schema; dual-write starts Day 2
 | **Agent** | Collects CPU, memory, and disk gauges every 5 seconds |
 | **Ingestion API** | Validates payloads, rate-limits, produces to Kafka |
 | **Kafka bus** | Partitioned ingest + DLQ; idempotent producer |
-| **Workers** | Standalone consumers; commit offsets after DB write |
-| **Query API** | Raw points + time-bucket aggregations |
+| **Workers** | Standalone consumers; dual-write PG + ClickHouse; commit after both |
+| **Query API** | Raw points + time-bucket aggregations (aggregate still on PG until Day 3) |
 | **Idempotency** | `event_id` unique index in PostgreSQL |
 | **Ops** | `/health` (Kafka + ClickHouse), `/pipeline` (partition lag), `/dlq` |
 | **Agent resilience** | Retries + on-disk spool |
-| **ClickHouse (Day 1)** | Columnar store up; schema ensured on API boot |
+| **ClickHouse (Day 2)** | Dual-write analytics copy; schema + health from Day 1 |
 
 ---
 
@@ -54,9 +52,9 @@ InsightNode/
 │   └── data/
 ├── backend/
 │   ├── main.py              # FastAPI — ingest, query, pipeline, dlq
-│   ├── worker.py            # Kafka consumer → PostgreSQL
+│   ├── worker.py            # Kafka consumer → PostgreSQL + ClickHouse
 │   ├── kafka_client.py      # Phase 2 Day 5–6 Kafka helpers
-│   ├── clickhouse_client.py # Phase 3 Day 1 — connect + ensure schema
+│   ├── clickhouse_client.py # Phase 3 — connect, schema, insert_metrics
 │   ├── rate_limit.py        # Phase 2 Day 6 ingest rate limit
 │   ├── redis_client.py      # Phase 2 Days 1–4 (history)
 │   ├── database.py

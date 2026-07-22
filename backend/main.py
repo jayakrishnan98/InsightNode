@@ -1,7 +1,7 @@
 """
 InsightNode API — ingestion and query endpoints for host metrics.
 
-Architecture (Phase 3 Day 4):
+Architecture (Phase 3 complete):
     Agent --POST /metrics--> Kafka topic --standalone worker(s)--+--> PostgreSQL
                               (202 + rate limit)  (consumer group) |
                                                    │               +--> ClickHouse
@@ -9,7 +9,7 @@ Architecture (Phase 3 Day 4):
 
     GET /metrics                   → PostgreSQL (raw points)
     GET /metrics/aggregate         → ClickHouse (analytics)
-    GET /metrics/aggregate/compare → time both stores (Day 4 learning tool)
+    GET /metrics/aggregate/compare → time both stores (lab)
 """
 
 from datetime import datetime
@@ -121,7 +121,7 @@ async def lifespan(app: FastAPI):
     close_clickhouse()
 
 
-app = FastAPI(title="InsightNode", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.5.0", lifespan=lifespan)
 
 class Metric(BaseModel):
     """Single metric reading inside an ingestion payload (name, value, unit)."""

@@ -135,13 +135,15 @@ At 1,000 agents (51.8M rows/day), this table would grow to terabytes within week
 - Survives API restarts
 - Foundation for multiple consumers
 
-### Phase 3 — Time-series storage
+### Phase 3 — Time-series storage ✅
 
 - **Day 1:** ClickHouse up (Docker, MergeTree schema, health ping)
 - **Day 2:** Dual-write from Kafka workers (PostgreSQL + ClickHouse)
 - **Day 3:** Route `/metrics/aggregate` to ClickHouse
 - **Day 4:** Compare PostgreSQL vs columnar at scale
 - **Day 5:** Docs + graduation
+
+See [phase-3-graduation.md](phase-3-graduation.md).
 
 ### Phase 4 — Logs
 

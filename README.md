@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 3 Day 4 — compare PostgreSQL vs ClickHouse**  
-**Next: Phase 3 Day 5 — docs + graduation**
+**Current stage: Phase 3 complete (Day 5)**  
+**Next: Phase 4 — OpenSearch (centralized log search)**
 
-Phase 3 dual-writes to PostgreSQL + ClickHouse. Production aggregates use ClickHouse; `GET /metrics/aggregate/compare` times both stores so you can feel the difference at scale.
+Phase 3 dual-writes metrics to PostgreSQL + ClickHouse. Raw queries stay on PostgreSQL; aggregates and the optional compare lab endpoint use ClickHouse (and PG for timing).
 
 ---
 
@@ -27,7 +27,7 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
   └── GET /dlq
 ```
 
-### Features (Phase 1 + Phase 2)
+### Features (Phase 1–3)
 
 | Component | Capability |
 |-----------|------------|
@@ -39,7 +39,7 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
 | **Idempotency** | `event_id` unique index in PostgreSQL |
 | **Ops** | `/health` (Kafka + ClickHouse), `/pipeline` (partition lag), `/dlq` |
 | **Agent resilience** | Retries + on-disk spool |
-| **ClickHouse (Day 4)** | Dual-write + aggregates + PG vs CH compare |
+| **ClickHouse** | Columnar analytics store (Phase 3 complete) |
 
 ---
 
@@ -67,6 +67,7 @@ InsightNode/
 │   ├── phase-2-architecture.md
 │   ├── phase-2-graduation.md
 │   ├── phase-3-architecture.md
+│   ├── phase-3-graduation.md
 │   └── ...
 ├── docker-compose.yml       # Redpanda (:9092) + ClickHouse (:8123)
 ├── sql/
@@ -196,7 +197,7 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
-> See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) for ClickHouse (Days 1–4).
+> See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) and [docs/phase-3-graduation.md](docs/phase-3-graduation.md).
 > See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).
 > Redis Streams code (`backend/redis_client.py`) remains as Days 1–4 learning history.
 
@@ -345,16 +346,17 @@ See [docs/request-flows.md](docs/request-flows.md) for sequence diagrams.
 
 ## Known limitations (by design)
 
-These intentional Phase 1 constraints motivate Phase 2+.
+Earlier Phase 1 constraints that motivated later work:
 
-| Limitation | Impact |
+| Limitation | Status |
 |------------|--------|
-| In-memory queue | Metrics in the queue are lost if the API process crashes |
-| PostgreSQL for time-series | Slow at very high cardinality and volume; aggregation scans get expensive |
-| Single API process | No horizontal scaling |
-| Retry storm | Agent spends a long time retrying when API is down for extended periods |
-| No retention policy | Table grows indefinitely |
-| No percentiles (p95) | Deferred to a later phase |
+| In-memory queue | Addressed in Phase 2 (Kafka) |
+| PostgreSQL-only analytics | Addressed in Phase 3 (ClickHouse aggregates) |
+| Single API process | Partially addressed (workers scale; API still one process locally) |
+| Retry storm | Softened by durable bus + agent spool |
+| No retention policy | Still open (CH monthly partitions make this easier later) |
+| No percentiles (p95) | Deferred |
+| ClickHouse duplicates under rare redelivery | Accepted; `ReplacingMergeTree` later if needed |
 
 See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale analysis.
 
@@ -362,16 +364,18 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 
 ## Roadmap
 
-### Phase 2 (Day 13+) — Durable buffering
+### Completed
 
-- Redis replaces in-memory queue
-- Survives API restarts; foundation for horizontal scaling
+| Phase | Focus |
+|-------|-------|
+| 1 | Agent → API → queue → PostgreSQL; aggregates; idempotency |
+| 2 | Kafka ingest bus, workers, DLQ, rate limits, `/pipeline` |
+| 3 | ClickHouse dual-write + analytics + PG vs CH compare |
 
 ### Later phases
 
 | Phase | Focus |
 |-------|-------|
-| 3 | ClickHouse — Day 1 schema/health → Day 2 dual-write → Day 3 aggregate routing |
 | 4 | OpenSearch — centralized log search |
 | 5 | OpenTelemetry — distributed tracing |
 | 6 | Sharding, multi-tenancy, rate limiting, usage metering |
@@ -392,6 +396,19 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 - [x] Document architecture, flows, schema, and bottlenecks (Day 12)
 
 **Phase 1 graduation:** [docs/phase-1-graduation.md](docs/phase-1-graduation.md)
+
+---
+
+## Learning goals (Phase 3)
+
+- [x] Run ClickHouse locally and define a MergeTree metrics schema
+- [x] Dual-write from Kafka workers (PG idempotent + CH append)
+- [x] Route analytical aggregates to ClickHouse
+- [x] Measure PostgreSQL vs ClickHouse on the same query
+- [x] Document architecture and graduate Phase 3
+
+**Phase 3 graduation:** [docs/phase-3-graduation.md](docs/phase-3-graduation.md)  
+**Architecture:** [docs/phase-3-architecture.md](docs/phase-3-architecture.md)
 
 ---
 

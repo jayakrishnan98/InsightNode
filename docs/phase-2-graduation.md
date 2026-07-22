@@ -1,7 +1,7 @@
 # Phase 2 Graduation Checklist
 
 **Completed:** Phase 2 Day 6  
-**Next:** Phase 3 Day 1 — ClickHouse (schema + health); Day 2 dual-write
+**Next:** Phase 4 — OpenSearch (centralized log search)
 
 ---
 

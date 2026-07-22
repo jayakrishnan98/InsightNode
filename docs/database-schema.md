@@ -108,3 +108,12 @@ psql -U insightnode -d insightnode -f sql/migrations/001_add_event_id.sql
 | Table size | ~4 MB |
 
 Pre-Day-11 rows have `event_id = NULL` and are not deduplicated.
+
+---
+
+## Phase 3 — ClickHouse (analytics copy)
+
+PostgreSQL remains the idempotent row store for raw points. ClickHouse holds a dual-written copy for aggregates.
+
+Source: [`sql/clickhouse/schema.sql`](../sql/clickhouse/schema.sql)  
+Details: [`phase-3-architecture.md`](phase-3-architecture.md)

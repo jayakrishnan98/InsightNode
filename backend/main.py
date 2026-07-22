@@ -1,14 +1,14 @@
 """
 InsightNode API — ingestion and query endpoints for host metrics.
 
-Architecture (Phase 2 Day 6 — Phase 2 complete):
+Architecture (Phase 3 Day 1):
     Agent --POST /metrics--> Kafka topic --standalone worker(s)--> PostgreSQL
                               (202 + rate limit)  (consumer group + manual commit)
                                                    │
                                                    └─ poison → Kafka DLQ topic
 
-Day 6 adds: idempotent producer, per-partition lag (/pipeline), ingest rate limits.
-Redis Streams (Days 1–4) remain as learning history (redis_client.py).
+    ClickHouse is up (schema + health ping). Dual-write lands in Day 2;
+    aggregate query routing lands in Day 3.
 """
 
 from datetime import datetime, timezone
@@ -25,6 +25,11 @@ from contextlib import asynccontextmanager
 
 from backend.database import get_db
 from backend.models import MetricRecord
+from backend.clickhouse_client import (
+    close_client as close_clickhouse,
+    ensure_schema as ensure_clickhouse_schema,
+    ping as clickhouse_ping,
+)
 from backend.kafka_client import (
     MAX_DELIVERIES,
     QUEUE_MAX_LENGTH,
@@ -66,22 +71,26 @@ INTERVAL_MAP: dict[str, str] = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    API lifespan: ensure Kafka topics + producer; optionally start embedded worker.
+    API lifespan: Kafka + ClickHouse bootstrap; optionally start embedded worker.
 
     Logic:
         - ensure_topics() so produce never hits UNKNOWN_TOPIC on first boot.
+        - ensure_clickhouse_schema() so insightnode.metrics exists.
         - Create a process-wide KafkaProducer.
         - If EMBEDDED_WORKER=1, spawn in-process worker thread.
 
     Reason:
-        Producers should be long-lived (connection reuse). Topics must exist
-        before agents start posting.
+        Producers should be long-lived (connection reuse). Topics and CH schema
+        must exist before agents start posting / Day 2 dual-write begins.
     """
     global kafka_producer
 
     ensure_topics()
     kafka_producer = get_producer()
     logger.info("Kafka producer ready")
+
+    ensure_clickhouse_schema()
+    logger.info("ClickHouse schema ready")
 
     stop_event = None
     worker_thread = None
@@ -117,8 +126,10 @@ async def lifespan(app: FastAPI):
         kafka_producer.close()
         kafka_producer = None
 
+    close_clickhouse()
 
-app = FastAPI(title="InsightNode", version="0.3.1", lifespan=lifespan)
+
+app = FastAPI(title="InsightNode", version="0.4.0", lifespan=lifespan)
 
 class Metric(BaseModel):
     """Single metric reading inside an ingestion payload (name, value, unit)."""
@@ -179,15 +190,16 @@ def health_check():
     Liveness probe and ingest pipeline visibility.
 
     Logic:
-        - Ping Kafka; report approximate consumer lag and DLQ size.
+        - Ping Kafka and ClickHouse; report approximate consumer lag and DLQ size.
 
     Reason:
         High lag = workers behind. Growing dlq_size = poison payloads parked.
-        Use GET /pipeline for per-partition detail (Day 6).
+        clickhouse_ok proves Day 1 columnar store is reachable before dual-write.
     """
     return {
         "status": "ok",
         "kafka_ok": kafka_ping(),
+        "clickhouse_ok": clickhouse_ping(),
         "queue_backend": "kafka",
         "queue_size": approximate_lag(),
         "queue_maxsize": QUEUE_MAX_LENGTH,

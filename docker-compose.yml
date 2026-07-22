@@ -22,3 +22,32 @@ services:
     ports:
       - "9092:9092"
     # Kafka-compatible API for Phase 2 Day 5 (no Zookeeper needed)
+
+  # Phase 3 Day 1 — columnar store for analytical / aggregate queries
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: insightnode-clickhouse
+    environment:
+      # Required: without these, Docker disables network access for `default`.
+      CLICKHOUSE_DB: insightnode
+      CLICKHOUSE_USER: insightnode
+      CLICKHOUSE_PASSWORD: insightnode
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8123:8123" # HTTP (clickhouse-connect)
+      - "9000:9000" # native TCP (clickhouse-client CLI)
+    volumes:
+      - ./sql/clickhouse:/docker-entrypoint-initdb.d:ro
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  clickhouse_data:

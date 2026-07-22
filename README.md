@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 2 complete (Day 6)**  
-**Next: Phase 3 — ClickHouse (time-series storage)**
+**Current stage: Phase 3 Day 1 — ClickHouse up**  
+**Next: Phase 3 Day 2 — dual-write (PostgreSQL + ClickHouse)**
 
-Phase 2 delivers a durable Kafka ingest bus with standalone workers, DLQ, rate limits, and pipeline observability. Redis Streams code remains as Days 1–4 learning history.
+Phase 2 delivers a durable Kafka ingest bus with standalone workers, DLQ, rate limits, and pipeline observability. Phase 3 Day 1 adds ClickHouse (schema + health); workers still write only to PostgreSQL until Day 2.
 
 ---
 
@@ -20,10 +20,12 @@ Agent (psutil + spool)
 FastAPI (rate limit) ──produce──► Kafka ──workers──► PostgreSQL
   │ 202 / 429 / 503                 │
   ├── GET /metrics                  └─ DLQ topic
-  ├── GET /metrics/aggregate
-  ├── GET /health
-  ├── GET /pipeline          (per-partition lag)
+  ├── GET /metrics/aggregate          (still PG until Day 3)
+  ├── GET /health          (+ clickhouse_ok)
+  ├── GET /pipeline
   └── GET /dlq
+
+ClickHouse (Day 1): running + schema; dual-write starts Day 2
 ```
 
 ### Features (Phase 1 + Phase 2)
@@ -36,8 +38,9 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
 | **Workers** | Standalone consumers; commit offsets after DB write |
 | **Query API** | Raw points + time-bucket aggregations |
 | **Idempotency** | `event_id` unique index in PostgreSQL |
-| **Ops** | `/health`, `/pipeline` (partition lag), `/dlq` |
+| **Ops** | `/health` (Kafka + ClickHouse), `/pipeline` (partition lag), `/dlq` |
 | **Agent resilience** | Retries + on-disk spool |
+| **ClickHouse (Day 1)** | Columnar store up; schema ensured on API boot |
 
 ---
 
@@ -53,6 +56,7 @@ InsightNode/
 │   ├── main.py              # FastAPI — ingest, query, pipeline, dlq
 │   ├── worker.py            # Kafka consumer → PostgreSQL
 │   ├── kafka_client.py      # Phase 2 Day 5–6 Kafka helpers
+│   ├── clickhouse_client.py # Phase 3 Day 1 — connect + ensure schema
 │   ├── rate_limit.py        # Phase 2 Day 6 ingest rate limit
 │   ├── redis_client.py      # Phase 2 Days 1–4 (history)
 │   ├── database.py
@@ -62,9 +66,13 @@ InsightNode/
 │   ├── phase-1-graduation.md
 │   ├── phase-2-architecture.md
 │   ├── phase-2-graduation.md
+│   ├── phase-3-architecture.md
 │   └── ...
-├── docker-compose.yml       # Redpanda (Kafka API :9092)
+├── docker-compose.yml       # Redpanda (:9092) + ClickHouse (:8123)
 ├── sql/
+│   ├── schema.sql           # PostgreSQL
+│   └── clickhouse/
+│       └── schema.sql       # ClickHouse MergeTree metrics
 └── requirements.txt
 ```
 
@@ -120,14 +128,15 @@ export DATABASE_URL="postgresql://user:password@localhost:5432/insightnode"
 
 Run from the **project root** (`InsightNode/`).
 
-### Start Kafka (Redpanda — Phase 2 Day 5)
+### Start Kafka + ClickHouse (Phase 2 / Phase 3 Day 1)
 
 ```bash
 docker compose up -d
 # Kafka API on localhost:9092
+# ClickHouse HTTP on localhost:8123  (user/pass: insightnode / insightnode)
 ```
 
-Install Python deps (includes `kafka-python`):
+Install Python deps (includes `kafka-python` + `clickhouse-connect`):
 
 ```bash
 pip install -r requirements.txt
@@ -178,7 +187,7 @@ Check pipeline health:
 
 ```bash
 curl http://127.0.0.1:8001/health
-# queue_backend: kafka, kafka_ok: true, queue_size (lag) near 0
+# queue_backend: kafka, kafka_ok: true, clickhouse_ok: true, queue_size (lag) near 0
 
 # Per-partition lag (Phase 2 Day 6)
 curl http://127.0.0.1:8001/pipeline
@@ -187,6 +196,7 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
+> See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) for ClickHouse Day 1.
 > See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).
 > Redis Streams code (`backend/redis_client.py`) remains as Days 1–4 learning history.
 
@@ -343,7 +353,7 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 
 | Phase | Focus |
 |-------|-------|
-| 3 | ClickHouse — time-series storage and analytical queries |
+| 3 | ClickHouse — Day 1 schema/health → Day 2 dual-write → Day 3 aggregate routing |
 | 4 | OpenSearch — centralized log search |
 | 5 | OpenTelemetry — distributed tracing |
 | 6 | Sharding, multi-tenancy, rate limiting, usage metering |

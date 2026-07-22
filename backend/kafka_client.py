@@ -42,8 +42,8 @@ def ensure_topics() -> None:
     Create ingest + DLQ topics if missing.
 
     Logic:
-        - AdminClient create_topics with 3 partitions / replication 1 (local).
-        - Ignore already-exists errors per topic future.
+        - List existing topics; create only missing ones (3 partitions / RF 1).
+        - Ignore TopicAlreadyExistsError if another process races us.
 
     Reason:
         Partitions enable parallel consumers in one group. Local Redpanda/Kafka
@@ -58,40 +58,41 @@ def ensure_topics() -> None:
         NewTopic(name=DLQ_TOPIC, num_partitions=1, replication_factor=1),
     ]
     try:
-        result = admin.create_topics(new_topics=topics, validate_only=False)
-        for topic, future in result.items():
-            try:
-                future.result()
-                logger.info("Created Kafka topic: %s", topic)
-            except TopicAlreadyExistsError:
-                pass
-            except Exception as e:
-                if "already exists" in str(e).lower():
-                    pass
-                else:
-                    raise
+        existing = set(admin.list_topics())
+        to_create = [t for t in topics if t.name not in existing]
+        if not to_create:
+            logger.info("Kafka topics already exist")
+            return
+
+        admin.create_topics(new_topics=to_create, validate_only=False)
+        for t in to_create:
+            logger.info("Created Kafka topic: %s", t.name)
+    except TopicAlreadyExistsError:
+        # Race: another process created the topic between list and create
+        pass
     finally:
         admin.close()
 
 
 def get_producer() -> KafkaProducer:
     """
-    Shared Kafka producer for the API (Phase 2 Day 6: idempotent).
+    Shared Kafka producer for the API (Phase 2 Day 6).
 
     Logic:
         - JSON serializers; key = machine_id for per-host partition affinity.
-        - acks=all + enable_idempotence=True + retries.
+        - acks=all + retries; max_in_flight=1 so retries don't reorder.
         - linger_ms batches tiny produces without hurting agent latency much.
 
     Reason:
-        Idempotent producer prevents duplicate Kafka records if the broker
-        acks late and the client retries — complements event_id at the DB layer.
+        kafka-python-ng has no enable_idempotence; acks=all + single in-flight
+        request is the practical equivalent for safe local retries. Complements
+        event_id at the DB layer for end-to-end dedupe.
     """
     return KafkaProducer(
         bootstrap_servers=KAFKA_BOOTSTRAP,
         acks="all",
         retries=5,
-        enable_idempotence=True,
+        max_in_flight_requests_per_connection=1,
         linger_ms=5,
         value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         key_serializer=lambda k: k.encode("utf-8") if k is not None else None,

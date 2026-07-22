@@ -5,15 +5,15 @@ Phase 3 adds a columnar time-series store for analytical queries, while keeping 
 ```
 Phase 2:  Agent → API → Kafka → worker → PostgreSQL
 Day 1:    + ClickHouse up (schema + health)
-Day 2:    worker dual-writes → PostgreSQL + ClickHouse   ← YOU ARE HERE
-Day 3:    GET /metrics/aggregate reads from ClickHouse
+Day 2:    worker dual-writes → PostgreSQL + ClickHouse
+Day 3:    GET /metrics/aggregate reads from ClickHouse   ← YOU ARE HERE
 Day 4:    Compare PostgreSQL vs ClickHouse at scale
 Day 5:    Docs + graduation
 ```
 
 ---
 
-## Current architecture (Day 2)
+## Current architecture (Day 3)
 
 ```mermaid
 flowchart LR
@@ -24,20 +24,33 @@ flowchart LR
   W --> PG[(PostgreSQL)]
   W --> CH[(ClickHouse)]
   API -->|GET /metrics raw| PG
-  API -->|GET /metrics/aggregate| PG
+  API -->|GET /metrics/aggregate| CH
   API -->|GET /health| CH
 ```
 
-| Layer | Technology | Day 2 status |
+| Layer | Technology | Day 3 status |
 |-------|------------|--------------|
 | Ingest bus | Kafka (Redpanda) | Unchanged from Phase 2 |
-| Row store | PostgreSQL | Idempotent writes (`event_id`) |
-| Columnar store | ClickHouse | Dual-written from the same worker batch |
-| Aggregate API | PostgreSQL `GROUP BY` | Still PG until Day 3 |
+| Row store | PostgreSQL | Idempotent writes + raw `GET /metrics` |
+| Columnar store | ClickHouse | Dual-written; serves aggregates |
+| Aggregate API | ClickHouse `toStartOfInterval` | Replaced PostgreSQL `date_bin` |
 
 ---
 
-## Dual-write commit order
+## Read-path split (the Day 3 lesson)
+
+| Endpoint | Store | Why |
+|----------|-------|-----|
+| `GET /metrics` | PostgreSQL | Point lookups / debugging; row store is fine |
+| `GET /metrics/aggregate` | ClickHouse | Dashboard buckets scan mostly the `value` column |
+
+Same response JSON as Phase 1/2 — only the engine behind `/metrics/aggregate` changed.
+
+ClickHouse bucketing uses `toStartOfInterval(timestamp, INTERVAL …)` instead of PostgreSQL `date_bin`.
+
+---
+
+## Dual-write commit order (Day 2, still in force)
 
 ```
 1. INSERT PostgreSQL  (ON CONFLICT DO NOTHING)
@@ -49,20 +62,7 @@ flowchart LR
 |---------|----------------|
 | PG fails | Offset not committed → Kafka redelivers |
 | PG ok, CH fails | Offset not committed → redeliver; PG dedupes; CH retries |
-| Both ok, offset commit fails | Redeliver → PG dedupes; **CH may duplicate** (accepted Day 2) |
-
-PostgreSQL remains the deduped source of truth. ClickHouse may see rare duplicates under at-least-once delivery until `ReplacingMergeTree` / stronger dedup later.
-
----
-
-## Why ClickHouse (the lesson)
-
-| Concern | PostgreSQL (row) | ClickHouse (columnar) |
-|---------|------------------|------------------------|
-| Write pattern | Good OLTP / mixed | Append-heavy metrics |
-| `AVG/MIN/MAX` over millions of rows | Scans whole rows | Reads mostly the `value` column |
-| Time-range drops | `DELETE` is expensive | Drop partitions by month |
-| Dedup | Unique index on `event_id` | No unique constraint yet |
+| Both ok, offset commit fails | Redeliver → PG dedupes; **CH may duplicate** (accepted for now) |
 
 ---
 
@@ -86,14 +86,11 @@ docker compose up -d
 uvicorn backend.main:app --reload --port 8001
 python -m backend.worker
 
-# Health
 curl http://127.0.0.1:8001/health
 # expect kafka_ok + clickhouse_ok true
 
-# After the agent runs, count CH rows:
-docker exec -it insightnode-clickhouse clickhouse-client \
-  --user insightnode --password insightnode \
-  -q "SELECT count() FROM insightnode.metrics"
+# Aggregate now hits ClickHouse (after dual-write has data):
+curl "http://127.0.0.1:8001/metrics/aggregate?machine_id=HOST&metric_name=cpu_usage&start_time=2026-07-22T00:00:00Z&end_time=2026-07-24T00:00:00Z&interval=5m"
 ```
 
 Env overrides (optional):
@@ -108,8 +105,8 @@ Env overrides (optional):
 
 ---
 
-## What Day 2 deliberately does not include
+## What Day 3 deliberately does not include
 
-- Routing `/metrics/aggregate` to ClickHouse → **Day 3**
+- Side-by-side PG vs CH timing → **Day 4**
 - `ReplacingMergeTree` / CH-side dedup → later if needed
-- Removing PostgreSQL → not this phase (dual-write keeps the comparison)
+- Removing PostgreSQL → not this phase

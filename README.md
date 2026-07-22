@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 3 Day 2 — dual-write (PostgreSQL + ClickHouse)**  
-**Next: Phase 3 Day 3 — route `/metrics/aggregate` to ClickHouse**
+**Current stage: Phase 3 Day 3 — aggregate queries on ClickHouse**  
+**Next: Phase 3 Day 4 — compare PostgreSQL vs ClickHouse at scale**
 
-Phase 2 delivers a durable Kafka ingest bus. Phase 3 Day 2 dual-writes each consumed batch to PostgreSQL (idempotent) and ClickHouse (analytics copy). Aggregate queries still hit PostgreSQL until Day 3.
+Phase 2 delivers a durable Kafka ingest bus. Phase 3 dual-writes to PostgreSQL + ClickHouse; `GET /metrics/aggregate` now reads from ClickHouse while raw `GET /metrics` stays on PostgreSQL.
 
 ---
 
@@ -18,9 +18,9 @@ Agent (psutil + spool)
     │  POST /metrics {event_id, ...}
     ▼
 FastAPI (rate limit) ──produce──► Kafka ──workers──► PostgreSQL
-  │ 202 / 429 / 503                 │            └─► ClickHouse (Day 2)
-  ├── GET /metrics                  └─ DLQ topic
-  ├── GET /metrics/aggregate          (still PG until Day 3)
+  │ 202 / 429 / 503                 │            └─► ClickHouse
+  ├── GET /metrics (PG)             └─ DLQ topic
+  ├── GET /metrics/aggregate (CH)
   ├── GET /health          (+ clickhouse_ok)
   ├── GET /pipeline
   └── GET /dlq
@@ -34,11 +34,11 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
 | **Ingestion API** | Validates payloads, rate-limits, produces to Kafka |
 | **Kafka bus** | Partitioned ingest + DLQ; idempotent producer |
 | **Workers** | Standalone consumers; dual-write PG + ClickHouse; commit after both |
-| **Query API** | Raw points + time-bucket aggregations (aggregate still on PG until Day 3) |
+| **Query API** | Raw points (PG) + time-bucket aggregations (ClickHouse) |
 | **Idempotency** | `event_id` unique index in PostgreSQL |
 | **Ops** | `/health` (Kafka + ClickHouse), `/pipeline` (partition lag), `/dlq` |
 | **Agent resilience** | Retries + on-disk spool |
-| **ClickHouse (Day 2)** | Dual-write analytics copy; schema + health from Day 1 |
+| **ClickHouse (Day 3)** | Dual-write + `/metrics/aggregate` read path |
 
 ---
 
@@ -194,7 +194,7 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
-> See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) for ClickHouse Day 1.
+> See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) for ClickHouse (Days 1–3).
 > See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).
 > Redis Streams code (`backend/redis_client.py`) remains as Days 1–4 learning history.
 
@@ -239,6 +239,8 @@ curl "http://127.0.0.1:8001/metrics?machine_id=my-machine&metric_name=cpu_usage&
 ```
 
 ### `GET /metrics/aggregate` — Query aggregated buckets
+
+Served from **ClickHouse** (Phase 3 Day 3). Raw `GET /metrics` remains on PostgreSQL.
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|

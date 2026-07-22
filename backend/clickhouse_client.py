@@ -3,7 +3,7 @@ ClickHouse client for Phase 3.
 
 Day 1: connect, ensure schema, health ping.
 Day 2: insert_metrics() for worker dual-write.
-Day 3: aggregate query routing (not yet).
+Day 3: query_aggregate() for GET /metrics/aggregate.
 """
 
 from __future__ import annotations
@@ -37,6 +37,19 @@ COLUMN_NAMES = [
     "timestamp",
     "event_id",
 ]
+
+# Allowlisted intervals only — interpolated into SQL (never from raw user text).
+CH_INTERVAL_MAP: dict[str, str] = {
+    "1m": "1 MINUTE",
+    "5m": "5 MINUTE",
+    "15m": "15 MINUTE",
+    "1h": "1 HOUR",
+    "3h": "3 HOUR",
+    "6h": "6 HOUR",
+    "12h": "12 HOUR",
+    "24h": "1 DAY",
+    "1d": "1 DAY",
+}
 
 _client: Client | None = None
 
@@ -176,6 +189,90 @@ def insert_metrics(rows: list[dict[str, Any]]) -> None:
         column_names=COLUMN_NAMES,
     )
     logger.info("ClickHouse insert: %s row(s) into %s", len(data), METRICS_TABLE)
+
+
+def query_aggregate(
+    *,
+    machine_id: str,
+    metric_name: str,
+    start_time: datetime,
+    end_time: datetime,
+    interval: str,
+) -> list[dict[str, Any]]:
+    """
+    Time-bucket aggregation for GET /metrics/aggregate (Phase 3 Day 3).
+
+    Logic:
+        - Map interval key → allowlisted ClickHouse INTERVAL literal.
+        - toStartOfInterval(timestamp, INTERVAL …) as bucket_start.
+        - AVG / MIN / MAX / count() grouped by machine, metric, bucket.
+        - Bind filters via clickhouse-connect parameters (not string concat).
+
+    Reason:
+        Columnar scans make dashboard-style aggregates cheaper than PostgreSQL
+        row scans at high volume. Same response shape as the old PG query.
+    """
+    ch_interval = CH_INTERVAL_MAP.get(interval)
+    if ch_interval is None:
+        raise ValueError(f"Unsupported interval: {interval!r}")
+
+    start_utc = _as_utc_datetime(start_time)
+    end_utc = _as_utc_datetime(end_time)
+
+    # ch_interval is allowlisted only — safe to embed in the INTERVAL clause.
+    sql = f"""
+        SELECT
+            machine_id,
+            metric_name,
+            toStartOfInterval(timestamp, INTERVAL {ch_interval}) AS bucket_start,
+            avg(value) AS avg,
+            min(value) AS min,
+            max(value) AS max,
+            count() AS sample_count
+        FROM {METRICS_TABLE}
+        WHERE machine_id = {{machine_id:String}}
+          AND metric_name = {{metric_name:String}}
+          AND timestamp >= {{start_time:DateTime64(3, 'UTC')}}
+          AND timestamp < {{end_time:DateTime64(3, 'UTC')}}
+        GROUP BY machine_id, metric_name, bucket_start
+        ORDER BY bucket_start ASC
+    """
+
+    result = get_client().query(
+        sql,
+        parameters={
+            "machine_id": machine_id,
+            "metric_name": metric_name,
+            "start_time": start_utc,
+            "end_time": end_utc,
+        },
+    )
+
+    buckets: list[dict[str, Any]] = []
+    for row in result.named_results():
+        bucket_start = row["bucket_start"]
+        if isinstance(bucket_start, datetime) and bucket_start.tzinfo is None:
+            bucket_start = bucket_start.replace(tzinfo=timezone.utc)
+        buckets.append(
+            {
+                "machine_id": row["machine_id"],
+                "metric_name": row["metric_name"],
+                "bucket_start": bucket_start,
+                "avg": float(row["avg"]),
+                "min": float(row["min"]),
+                "max": float(row["max"]),
+                "sample_count": int(row["sample_count"]),
+            }
+        )
+
+    logger.info(
+        "ClickHouse aggregate machine=%s metric=%s interval=%s buckets=%s",
+        machine_id,
+        metric_name,
+        interval,
+        len(buckets),
+    )
+    return buckets
 
 
 def close_client() -> None:

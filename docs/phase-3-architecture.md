@@ -6,51 +6,85 @@ Phase 3 adds a columnar time-series store for analytical queries, while keeping 
 Phase 2:  Agent → API → Kafka → worker → PostgreSQL
 Day 1:    + ClickHouse up (schema + health)
 Day 2:    worker dual-writes → PostgreSQL + ClickHouse
-Day 3:    GET /metrics/aggregate reads from ClickHouse   ← YOU ARE HERE
-Day 4:    Compare PostgreSQL vs ClickHouse at scale
+Day 3:    GET /metrics/aggregate reads from ClickHouse
+Day 4:    Compare PostgreSQL vs ClickHouse at scale   ← YOU ARE HERE
 Day 5:    Docs + graduation
 ```
 
 ---
 
-## Current architecture (Day 3)
+## Current architecture (Day 4)
 
 ```mermaid
 flowchart LR
   Agent -->|POST /metrics| API[FastAPI]
-  API -->|rate limit| API
   API -->|produce| K[(Kafka)]
   K --> W[workers]
   W --> PG[(PostgreSQL)]
   W --> CH[(ClickHouse)]
-  API -->|GET /metrics raw| PG
+  API -->|GET /metrics| PG
   API -->|GET /metrics/aggregate| CH
-  API -->|GET /health| CH
+  API -->|GET /metrics/aggregate/compare| PG
+  API -->|GET /metrics/aggregate/compare| CH
 ```
 
-| Layer | Technology | Day 3 status |
+| Layer | Technology | Day 4 status |
 |-------|------------|--------------|
-| Ingest bus | Kafka (Redpanda) | Unchanged from Phase 2 |
-| Row store | PostgreSQL | Idempotent writes + raw `GET /metrics` |
-| Columnar store | ClickHouse | Dual-written; serves aggregates |
-| Aggregate API | ClickHouse `toStartOfInterval` | Replaced PostgreSQL `date_bin` |
+| Ingest | Kafka → dual-write | Unchanged |
+| Raw reads | PostgreSQL | `GET /metrics` |
+| Analytics | ClickHouse | `GET /metrics/aggregate` |
+| Learning tool | Both | `GET /metrics/aggregate/compare` |
 
 ---
 
-## Read-path split (the Day 3 lesson)
+## Day 4 lesson — measure, don't guess
 
-| Endpoint | Store | Why |
-|----------|-------|-----|
-| `GET /metrics` | PostgreSQL | Point lookups / debugging; row store is fine |
-| `GET /metrics/aggregate` | ClickHouse | Dashboard buckets scan mostly the `value` column |
+At small row counts both stores feel fast — and ClickHouse HTTP overhead can even lose a micro-benchmark. Day 4 makes the difference visible at larger N:
 
-Same response JSON as Phase 1/2 — only the engine behind `/metrics/aggregate` changed.
+1. **Seed** identical rows into PG + CH (`tests/load/seed_aggregate_compare.py`)
+2. **Compare** the same aggregate filter/interval on both stores
+3. **Read** `speedup_median` ≈ `postgres_ms / clickhouse_ms` (values > 1 mean CH was faster)
 
-ClickHouse bucketing uses `toStartOfInterval(timestamp, INTERVAL …)` instead of PostgreSQL `date_bin`.
+| Signal | Meaning |
+|--------|---------|
+| `postgres.ms_median` | Row-store aggregate cost |
+| `clickhouse.ms_median` | Columnar aggregate cost |
+| `speedup_median` | How many times faster CH median was |
+| `sample_totals_match` | False → often CH duplicates from at-least-once dual-write |
+
+Production traffic still uses ClickHouse only for `/metrics/aggregate`. Compare is a lab endpoint.
 
 ---
 
-## Dual-write commit order (Day 2, still in force)
+## How to run the experiment
+
+```bash
+# 1. Infra + API
+docker compose up -d
+uvicorn backend.main:app --reload --port 8001
+
+# 2. Seed ~50k identical rows into both stores (skip Kafka)
+python tests/load/seed_aggregate_compare.py --rows 200000
+
+# 3. Compare (warm up once, then trust median of runs=5)
+curl "http://127.0.0.1:8001/metrics/aggregate/compare?machine_id=compare-bench&metric_name=cpu_usage&start_time=2026-06-01T00:00:00Z&end_time=2026-07-01T00:00:00Z&interval=5m&runs=5"
+```
+
+Optional: `--rows 200000` for a clearer gap. Add `&include_buckets=true` to inspect series.
+
+---
+
+## Read-path split (Day 3, still production)
+
+| Endpoint | Store |
+|----------|-------|
+| `GET /metrics` | PostgreSQL |
+| `GET /metrics/aggregate` | ClickHouse |
+| `GET /metrics/aggregate/compare` | Both (timed) |
+
+---
+
+## Dual-write commit order (Day 2)
 
 ```
 1. INSERT PostgreSQL  (ON CONFLICT DO NOTHING)
@@ -58,55 +92,22 @@ ClickHouse bucketing uses `toStartOfInterval(timestamp, INTERVAL …)` instead o
 3. Kafka offset commit
 ```
 
-| Failure | What happens |
-|---------|----------------|
-| PG fails | Offset not committed → Kafka redelivers |
-| PG ok, CH fails | Offset not committed → redeliver; PG dedupes; CH retries |
-| Both ok, offset commit fails | Redeliver → PG dedupes; **CH may duplicate** (accepted for now) |
-
 ---
 
 ## Schema (`insightnode.metrics`)
 
 Source: [`sql/clickhouse/schema.sql`](../sql/clickhouse/schema.sql)
 
-| Choice | Value | Why |
-|--------|-------|-----|
-| Engine | `MergeTree` | Append-oriented columnar default |
-| `PARTITION BY` | `toYYYYMM(timestamp)` | Cheap time-range pruning / retention later |
-| `ORDER BY` | `(machine_id, metric_name, timestamp)` | Matches aggregate filter pattern |
-| Idempotency | None in CH yet | PG unique index remains source of truth |
+| Choice | Value |
+|--------|-------|
+| Engine | `MergeTree` |
+| `PARTITION BY` | `toYYYYMM(timestamp)` |
+| `ORDER BY` | `(machine_id, metric_name, timestamp)` |
 
 ---
 
-## Local ops
+## What Day 4 deliberately does not include
 
-```bash
-docker compose up -d
-uvicorn backend.main:app --reload --port 8001
-python -m backend.worker
-
-curl http://127.0.0.1:8001/health
-# expect kafka_ok + clickhouse_ok true
-
-# Aggregate now hits ClickHouse (after dual-write has data):
-curl "http://127.0.0.1:8001/metrics/aggregate?machine_id=HOST&metric_name=cpu_usage&start_time=2026-07-22T00:00:00Z&end_time=2026-07-24T00:00:00Z&interval=5m"
-```
-
-Env overrides (optional):
-
-| Variable | Default |
-|----------|---------|
-| `CLICKHOUSE_HOST` | `localhost` |
-| `CLICKHOUSE_PORT` | `8123` |
-| `CLICKHOUSE_USER` | `insightnode` |
-| `CLICKHOUSE_PASSWORD` | `insightnode` |
-| `CLICKHOUSE_DATABASE` | `insightnode` |
-
----
-
-## What Day 3 deliberately does not include
-
-- Side-by-side PG vs CH timing → **Day 4**
-- `ReplacingMergeTree` / CH-side dedup → later if needed
-- Removing PostgreSQL → not this phase
+- Formal graduation checklist → **Day 5**
+- `ReplacingMergeTree` / CH-side dedup
+- Removing PostgreSQL

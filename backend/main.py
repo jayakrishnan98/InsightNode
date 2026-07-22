@@ -1,21 +1,23 @@
 """
 InsightNode API — ingestion and query endpoints for host metrics.
 
-Architecture (Phase 3 Day 3):
+Architecture (Phase 3 Day 4):
     Agent --POST /metrics--> Kafka topic --standalone worker(s)--+--> PostgreSQL
                               (202 + rate limit)  (consumer group) |
                                                    │               +--> ClickHouse
                                                    └─ poison → Kafka DLQ topic
 
-    GET /metrics              → PostgreSQL (raw points)
-    GET /metrics/aggregate    → ClickHouse (time-bucket analytics)
+    GET /metrics                   → PostgreSQL (raw points)
+    GET /metrics/aggregate         → ClickHouse (analytics)
+    GET /metrics/aggregate/compare → time both stores (Day 4 learning tool)
 """
 
 from datetime import datetime
 from typing import Optional, Literal
-
 import logging
 import os
+import statistics
+import time
 
 from fastapi import Depends, FastAPI, Query, HTTPException
 from pydantic import BaseModel, Field
@@ -31,6 +33,7 @@ from backend.clickhouse_client import (
     ping as clickhouse_ping,
     query_aggregate as clickhouse_query_aggregate,
 )
+from backend.postgres_aggregate import query_aggregate as postgres_query_aggregate
 from backend.kafka_client import (
     MAX_DELIVERIES,
     QUEUE_MAX_LENGTH,
@@ -171,6 +174,31 @@ class MetricsQueryResponse(BaseModel):
     """Wrapper for query results: total count plus list of metric points."""
     count: int
     metrics: list[MetricPoint]
+
+
+class StoreTiming(BaseModel):
+    """Timing stats for one store over N runs."""
+    store: str
+    runs: int
+    ms_min: float
+    ms_median: float
+    ms_max: float
+    bucket_count: int
+    sample_total: int
+
+
+class AggregateCompareResponse(BaseModel):
+    """Side-by-side PostgreSQL vs ClickHouse aggregate timing (Phase 3 Day 4)."""
+    interval: str
+    runs: int
+    postgres: StoreTiming
+    clickhouse: StoreTiming
+    speedup_median: float | None  # postgres_median / clickhouse_median
+    buckets_match: bool
+    sample_totals_match: bool
+    notes: list[str]
+    postgres_buckets: list[MetricBucket] | None = None
+    clickhouse_buckets: list[MetricBucket] | None = None
 
 
 @app.get("/health")
@@ -409,4 +437,131 @@ def query_metrics_aggregate(
         interval=interval,
         count=len(buckets),
         buckets=buckets,
+    )
+
+
+def _rows_to_buckets(rows: list[dict]) -> list[MetricBucket]:
+    return [
+        MetricBucket(
+            machine_id=row["machine_id"],
+            metric_name=row["metric_name"],
+            bucket_start=row["bucket_start"],
+            avg=round(float(row["avg"]), 2),
+            min=round(float(row["min"]), 2),
+            max=round(float(row["max"]), 2),
+            sample_count=row["sample_count"],
+        )
+        for row in rows
+    ]
+
+
+def _time_runs(fn, runs: int) -> tuple[list[float], list[dict]]:
+    """Run fn() `runs` times; return (elapsed_ms list, last result rows)."""
+    timings_ms: list[float] = []
+    last: list[dict] = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        last = fn()
+        timings_ms.append((time.perf_counter() - t0) * 1000.0)
+    return timings_ms, last
+
+
+@app.get("/metrics/aggregate/compare", response_model=AggregateCompareResponse)
+def compare_metrics_aggregate(
+    machine_id: str = Query(..., examples=["compare-bench"]),
+    metric_name: str = Query(..., examples=["cpu_usage"]),
+    start_time: datetime = Query(..., examples=["2026-07-01T00:00:00+00:00"]),
+    end_time: datetime = Query(..., examples=["2026-07-23T00:00:00+00:00"]),
+    interval: Literal["1m", "5m", "15m", "1h", "3h", "6h", "12h", "24h", "1d"] = Query("5m"),
+    runs: int = Query(3, ge=1, le=20),
+    include_buckets: bool = Query(False),
+    db: Session = Depends(get_db),
+):
+    """
+    Run the same aggregate on PostgreSQL and ClickHouse; report timings (Day 4).
+
+    Logic:
+        - Execute each store `runs` times; record min / median / max ms.
+        - Compare bucket counts and sum(sample_count).
+        - Optionally return both bucket series for inspection.
+
+    Reason:
+        Feeling why columnar wins for analytics requires measuring the same
+        query on both engines against enough rows (see tests/load/seed_aggregate_compare.py).
+    """
+    if start_time >= end_time:
+        raise HTTPException(status_code=400, detail="start_time must be before end_time")
+
+    try:
+        pg_ms, pg_rows = _time_runs(
+            lambda: postgres_query_aggregate(
+                db,
+                machine_id=machine_id,
+                metric_name=metric_name,
+                start_time=start_time,
+                end_time=end_time,
+                interval=interval,
+            ),
+            runs,
+        )
+        ch_ms, ch_rows = _time_runs(
+            lambda: clickhouse_query_aggregate(
+                machine_id=machine_id,
+                metric_name=metric_name,
+                start_time=start_time,
+                end_time=end_time,
+                interval=interval,
+            ),
+            runs,
+        )
+    except Exception:
+        logger.exception("Aggregate compare failed")
+        raise HTTPException(status_code=503, detail="Aggregate compare failed")
+
+    pg_buckets = _rows_to_buckets(pg_rows)
+    ch_buckets = _rows_to_buckets(ch_rows)
+    pg_samples = sum(b.sample_count for b in pg_buckets)
+    ch_samples = sum(b.sample_count for b in ch_buckets)
+
+    pg_median = statistics.median(pg_ms)
+    ch_median = statistics.median(ch_ms)
+    speedup = round(pg_median / ch_median, 2) if ch_median > 0 else None
+
+    notes: list[str] = [
+        "Production /metrics/aggregate still uses ClickHouse only.",
+        "Warm both stores with a few compare calls; first run includes cold-start noise.",
+        "Seed larger data with: python tests/load/seed_aggregate_compare.py",
+    ]
+    if pg_samples != ch_samples:
+        notes.append(
+            "sample_totals differ — often ClickHouse duplicates from at-least-once dual-write."
+        )
+
+    return AggregateCompareResponse(
+        interval=interval,
+        runs=runs,
+        postgres=StoreTiming(
+            store="postgresql",
+            runs=runs,
+            ms_min=round(min(pg_ms), 3),
+            ms_median=round(pg_median, 3),
+            ms_max=round(max(pg_ms), 3),
+            bucket_count=len(pg_buckets),
+            sample_total=pg_samples,
+        ),
+        clickhouse=StoreTiming(
+            store="clickhouse",
+            runs=runs,
+            ms_min=round(min(ch_ms), 3),
+            ms_median=round(ch_median, 3),
+            ms_max=round(max(ch_ms), 3),
+            bucket_count=len(ch_buckets),
+            sample_total=ch_samples,
+        ),
+        speedup_median=speedup,
+        buckets_match=len(pg_buckets) == len(ch_buckets),
+        sample_totals_match=pg_samples == ch_samples,
+        notes=notes,
+        postgres_buckets=pg_buckets if include_buckets else None,
+        clickhouse_buckets=ch_buckets if include_buckets else None,
     )

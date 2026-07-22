@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 3 Day 3 — aggregate queries on ClickHouse**  
-**Next: Phase 3 Day 4 — compare PostgreSQL vs ClickHouse at scale**
+**Current stage: Phase 3 Day 4 — compare PostgreSQL vs ClickHouse**  
+**Next: Phase 3 Day 5 — docs + graduation**
 
-Phase 2 delivers a durable Kafka ingest bus. Phase 3 dual-writes to PostgreSQL + ClickHouse; `GET /metrics/aggregate` now reads from ClickHouse while raw `GET /metrics` stays on PostgreSQL.
+Phase 3 dual-writes to PostgreSQL + ClickHouse. Production aggregates use ClickHouse; `GET /metrics/aggregate/compare` times both stores so you can feel the difference at scale.
 
 ---
 
@@ -21,6 +21,7 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
   │ 202 / 429 / 503                 │            └─► ClickHouse
   ├── GET /metrics (PG)             └─ DLQ topic
   ├── GET /metrics/aggregate (CH)
+  ├── GET /metrics/aggregate/compare
   ├── GET /health          (+ clickhouse_ok)
   ├── GET /pipeline
   └── GET /dlq
@@ -34,11 +35,11 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
 | **Ingestion API** | Validates payloads, rate-limits, produces to Kafka |
 | **Kafka bus** | Partitioned ingest + DLQ; idempotent producer |
 | **Workers** | Standalone consumers; dual-write PG + ClickHouse; commit after both |
-| **Query API** | Raw points (PG) + time-bucket aggregations (ClickHouse) |
+| **Query API** | Raw points (PG) + aggregations (CH) + timed compare |
 | **Idempotency** | `event_id` unique index in PostgreSQL |
 | **Ops** | `/health` (Kafka + ClickHouse), `/pipeline` (partition lag), `/dlq` |
 | **Agent resilience** | Retries + on-disk spool |
-| **ClickHouse (Day 3)** | Dual-write + `/metrics/aggregate` read path |
+| **ClickHouse (Day 4)** | Dual-write + aggregates + PG vs CH compare |
 
 ---
 
@@ -54,7 +55,8 @@ InsightNode/
 │   ├── main.py              # FastAPI — ingest, query, pipeline, dlq
 │   ├── worker.py            # Kafka consumer → PostgreSQL + ClickHouse
 │   ├── kafka_client.py      # Phase 2 Day 5–6 Kafka helpers
-│   ├── clickhouse_client.py # Phase 3 — connect, schema, insert_metrics
+│   ├── clickhouse_client.py # Phase 3 — connect, insert, aggregate
+│   ├── postgres_aggregate.py# Phase 3 Day 4 — PG aggregate for compare
 │   ├── rate_limit.py        # Phase 2 Day 6 ingest rate limit
 │   ├── redis_client.py      # Phase 2 Days 1–4 (history)
 │   ├── database.py
@@ -194,7 +196,7 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
-> See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) for ClickHouse (Days 1–3).
+> See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) for ClickHouse (Days 1–4).
 > See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).
 > Redis Streams code (`backend/redis_client.py`) remains as Days 1–4 learning history.
 
@@ -255,6 +257,22 @@ Example:
 ```bash
 curl "http://127.0.0.1:8001/metrics/aggregate?machine_id=my-machine&metric_name=cpu_usage&start_time=2026-07-10T05:00:00%2B00:00&end_time=2026-07-10T06:00:00%2B00:00&interval=5m"
 ```
+
+### `GET /metrics/aggregate/compare` — Time PostgreSQL vs ClickHouse (Day 4)
+
+Runs the same aggregate on both stores and returns min/median/max latency plus `speedup_median`.
+
+```bash
+# Seed identical data into both stores first:
+python tests/load/seed_aggregate_compare.py --rows 50000
+
+curl "http://127.0.0.1:8001/metrics/aggregate/compare?machine_id=compare-bench&metric_name=cpu_usage&start_time=2026-06-01T00:00:00Z&end_time=2026-07-01T00:00:00Z&interval=5m&runs=5"
+```
+
+| Extra parameter | Default | Description |
+|-----------------|---------|-------------|
+| `runs` | `3` | How many times to run each store |
+| `include_buckets` | `false` | Include both bucket series in the response |
 
 ### `GET /health` — Pipeline health
 

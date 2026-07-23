@@ -18,10 +18,11 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from fastapi import Header, HTTPException
-from sqlalchemy import Boolean, DateTime, String, Text, func, select, text
+from sqlalchemy import Boolean, DateTime, Integer, String, Text, func, select, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base, SessionLocal, engine
+from backend.rate_limit import RATE_LIMIT_MAX
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,8 @@ class Tenant(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     api_key: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Phase 6 Day 3: NULL → use global RATE_LIMIT_MAX; else tenant plan ceiling.
+    rate_limit_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -65,6 +68,7 @@ class TenantContext:
 
     tenant_id: str
     name: str
+    rate_limit_max: int  # Effective ceiling (never None after resolve)
 
 
 def ensure_tenants_schema_and_seed() -> None:
@@ -73,6 +77,7 @@ def ensure_tenants_schema_and_seed() -> None:
 
     Logic:
         - CREATE TABLE via SQLAlchemy metadata for `tenants` only.
+        - ALTER ADD rate_limit_max for pre-Day-3 databases.
         - Upsert default tenant by tenant_id (api_key from env).
 
     Reason:
@@ -80,6 +85,13 @@ def ensure_tenants_schema_and_seed() -> None:
         for local labs without manual SQL.
     """
     Tenant.__table__.create(bind=engine, checkfirst=True)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE tenants "
+                "ADD COLUMN IF NOT EXISTS rate_limit_max INTEGER"
+            )
+        )
 
     db = SessionLocal()
     try:
@@ -91,6 +103,7 @@ def ensure_tenants_schema_and_seed() -> None:
                     name=DEFAULT_TENANT_NAME,
                     api_key=DEFAULT_API_KEY,
                     active=True,
+                    rate_limit_max=None,
                     notes="Seeded by Phase 6 Day 1 for local learning",
                 )
             )
@@ -153,6 +166,21 @@ def ensure_metrics_tenant_isolation() -> None:
     logger.info("PostgreSQL metrics tenant isolation ready")
 
 
+def _effective_rate_limit(row) -> int:
+    """Tenant plan ceiling, or global RATE_LIMIT_MAX when unset."""
+    if row is not None and row.rate_limit_max is not None:
+        return int(row.rate_limit_max)
+    return RATE_LIMIT_MAX
+
+
+def _context_from_row(row) -> TenantContext:
+    return TenantContext(
+        tenant_id=row.tenant_id,
+        name=row.name,
+        rate_limit_max=_effective_rate_limit(row),
+    )
+
+
 def resolve_tenant_by_api_key(db, api_key: str | None) -> TenantContext:
     """
     Map X-API-Key → TenantContext.
@@ -161,6 +189,7 @@ def resolve_tenant_by_api_key(db, api_key: str | None) -> TenantContext:
         - Look up active tenant by api_key.
         - If missing and TENANCY_STRICT=0 → fall back to default tenant.
         - If missing and TENANCY_STRICT=1 → 401.
+        - Attach effective rate_limit_max (Phase 6 Day 3).
 
     Reason:
         Strict mode teaches real SaaS auth; soft mode keeps older curl labs working.
@@ -170,7 +199,7 @@ def resolve_tenant_by_api_key(db, api_key: str | None) -> TenantContext:
             select(Tenant).where(Tenant.api_key == api_key, Tenant.active.is_(True))
         )
         if row is not None:
-            return TenantContext(tenant_id=row.tenant_id, name=row.name)
+            return _context_from_row(row)
 
     if TENANCY_STRICT:
         raise HTTPException(
@@ -186,7 +215,7 @@ def resolve_tenant_by_api_key(db, api_key: str | None) -> TenantContext:
         raise HTTPException(status_code=503, detail="Default tenant not configured")
     if api_key and api_key != row.api_key:
         logger.warning("Unknown API key — falling back to default tenant (soft mode)")
-    return TenantContext(tenant_id=row.tenant_id, name=row.name)
+    return _context_from_row(row)
 
 
 def require_tenant(
@@ -205,7 +234,7 @@ def require_tenant(
 
 
 def list_tenants() -> list[dict]:
-    """Return active tenants (api keys masked)."""
+    """Return active tenants (api keys masked; include effective rate limit)."""
     db = SessionLocal()
     try:
         rows = db.scalars(
@@ -216,6 +245,8 @@ def list_tenants() -> list[dict]:
                 "tenant_id": t.tenant_id,
                 "name": t.name,
                 "api_key_hint": _mask_key(t.api_key),
+                "rate_limit_max": _effective_rate_limit(t),
+                "rate_limit_max_override": t.rate_limit_max,
                 "created_at": t.created_at.isoformat() if t.created_at else None,
             }
             for t in rows

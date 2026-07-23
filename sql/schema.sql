@@ -31,10 +31,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_metrics_dedup
 
 -- Phase 6 Day 1: tenant registry (also ensured by backend.tenancy on API boot)
 CREATE TABLE IF NOT EXISTS tenants (
-    tenant_id   VARCHAR(64) PRIMARY KEY,
-    name        VARCHAR(255) NOT NULL,
-    api_key     VARCHAR(128) NOT NULL UNIQUE,
-    active      BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    notes       TEXT
+    tenant_id       VARCHAR(64) PRIMARY KEY,
+    name            VARCHAR(255) NOT NULL,
+    api_key         VARCHAR(128) NOT NULL UNIQUE,
+    active          BOOLEAN NOT NULL DEFAULT TRUE,
+    rate_limit_max  INTEGER,  -- Phase 6 Day 3; NULL = use RATE_LIMIT_MAX env
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    notes           TEXT
 );

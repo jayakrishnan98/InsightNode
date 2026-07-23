@@ -1,9 +1,9 @@
 """
-InsightNode API — metrics, logs, traces, and multi-tenant isolation (Phase 6 Day 2).
+InsightNode API — multi-tenant ingest with per-tenant rate limits (Phase 6 Day 3).
 
-Architecture (Phase 6 Day 2):
-    X-API-Key → tenant_id persisted in PG / ClickHouse / OpenSearch.
-    All query paths filter by the authenticated tenant.
+Architecture (Phase 6 Day 3):
+    X-API-Key → tenant_id; sliding-window rate limit per tenant (metrics + logs).
+    Storage remains tenant-scoped (Day 2).
 """
 
 from datetime import datetime
@@ -53,6 +53,7 @@ from backend.rate_limit import (
     RATE_LIMIT_MAX,
     RATE_LIMIT_WINDOW_SECONDS,
     ingest_rate_limiter,
+    tenant_rate_key,
 )
 from backend import logship as backend_logship
 from backend.tenancy import (
@@ -149,7 +150,7 @@ async def lifespan(app: FastAPI):
     shutdown_tracing()
 
 
-app = FastAPI(title="InsightNode", version="0.10.1", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.10.2", lifespan=lifespan)
 
 # Phase 5 Day 2: instrument BEFORE the ASGI server starts (cannot add middleware later).
 if setup_tracing():
@@ -311,6 +312,7 @@ def health_check():
         "max_deliveries": MAX_DELIVERIES,
         "rate_limit_max": RATE_LIMIT_MAX,
         "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
+        "rate_limit_scope": "tenant",
         "worker_mode": "embedded" if EMBEDDED_WORKER else "external",
     }
 
@@ -348,7 +350,8 @@ def pipeline_status():
         "backpressure_max_lag": QUEUE_MAX_LENGTH,
         "max_deliveries": MAX_DELIVERIES,
         "rate_limit": {
-            "max": RATE_LIMIT_MAX,
+            "scope": "tenant",
+            "default_max": RATE_LIMIT_MAX,
             "window_seconds": RATE_LIMIT_WINDOW_SECONDS,
         },
         "worker_mode": "embedded" if EMBEDDED_WORKER else "external",
@@ -379,15 +382,16 @@ def ingest_logs(
     Accept structured logs and index them into OpenSearch (Phase 4 Day 2).
 
     Logic:
-        - Resolve tenant from X-API-Key (Phase 6 Day 1).
-        - Stamp tenant_id into each log's attrs (storage field comes Day 2).
-        - Bulk-index into insightnode-logs using event_id as document _id.
-        - Return 202 with indexed count + ids.
+        - Resolve tenant from X-API-Key.
+        - Per-tenant rate limit (Phase 6 Day 3) → 429 if exceeded.
+        - Stamp tenant_id on each document; bulk-index into insightnode-logs.
 
     Reason:
-        Logs are text events, not gauges — OpenSearch is the right store.
-        Tenant identity on Day 1 prepares isolation without a mapping migration yet.
+        Logs share the same tenant budget as metrics — one noisy logshipper
+        should not bypass SaaS plan limits.
     """
+    _enforce_tenant_rate_limit(tenant, route="logs")
+
     docs = []
     for log in payload.logs:
         doc = log.model_dump(mode="json")
@@ -544,6 +548,49 @@ def query_metrics(
     return MetricsQueryResponse(count=len(metrics), metrics=metrics)
 
 
+def _enforce_tenant_rate_limit(tenant: TenantContext, *, route: str) -> None:
+    """
+    Shared ingest gate: one sliding window per tenant (Phase 6 Day 3).
+
+    Metrics and logs share the same counter so a noisy logshipper cannot burn
+    past the plan ceiling that metrics alone would hit.
+    """
+    key = tenant_rate_key(tenant.tenant_id)
+    if ingest_rate_limiter.allow(key, max_requests=tenant.rate_limit_max):
+        return
+
+    snap = ingest_rate_limiter.snapshot(key, max_requests=tenant.rate_limit_max)
+    logger.warning(
+        "Rate limit exceeded tenant=%s route=%s count=%s max=%s",
+        tenant.tenant_id,
+        route,
+        snap["count"],
+        snap["max"],
+    )
+    backend_logship.warn(
+        "api",
+        "Ingest rate limit exceeded",
+        tenant_id=tenant.tenant_id,
+        route=route,
+        rate_limit_max=tenant.rate_limit_max,
+        window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+        count=snap["count"],
+    )
+    raise HTTPException(
+        status_code=429,
+        detail=(
+            f"Rate limit exceeded for tenant {tenant.tenant_id}: "
+            f"max {tenant.rate_limit_max} ingest requests "
+            f"per {RATE_LIMIT_WINDOW_SECONDS:.0f}s"
+        ),
+        headers={
+            "Retry-After": str(int(RATE_LIMIT_WINDOW_SECONDS)),
+            "X-RateLimit-Limit": str(tenant.rate_limit_max),
+            "X-RateLimit-Remaining": "0",
+        },
+    )
+
+
 @app.post("/metrics", status_code=202)
 def ingest_metrics(
     payload: MetricsPayload,
@@ -553,38 +600,20 @@ def ingest_metrics(
     Accept metrics from agents — produce to Kafka for async persistence.
 
     Logic:
-        - Resolve tenant from X-API-Key (Phase 6 Day 1).
-        - Per-machine_id rate limit → 429 if exceeded (per-tenant limits = Day 3).
-        - Stamp tenant_id onto the Kafka payload (storage columns = Day 2).
+        - Resolve tenant from X-API-Key.
+        - Per-tenant rate limit (Phase 6 Day 3) → 429 if exceeded.
+        - Stamp tenant_id onto the Kafka payload.
         - Produce JSON to insightnode.ingest (key=machine_id).
         - If lag too high → 503 backpressure.
-        - Return 202 Accepted with approximate lag.
 
     Reason:
-        Rate limit protects the pipeline from a runaway agent.
-        Lag-based 503 protects when workers fall behind.
-        202 = accepted for processing, not yet stored.
+        Tenant budget is the SaaS plan ceiling — all agents for one customer
+        share one sliding window (not one window per machine).
     """
     if kafka_producer is None:
         raise HTTPException(status_code=503, detail="Kafka producer not ready")
 
-    if not ingest_rate_limiter.allow(payload.machine_id):
-        logger.warning("Rate limit exceeded machine=%s", payload.machine_id)
-        backend_logship.warn(
-            "api",
-            "Ingest rate limit exceeded",
-            machine_id=payload.machine_id,
-            tenant_id=tenant.tenant_id,
-            rate_limit_max=RATE_LIMIT_MAX,
-            window_seconds=RATE_LIMIT_WINDOW_SECONDS,
-        )
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"Rate limit exceeded: max {RATE_LIMIT_MAX} requests "
-                f"per {RATE_LIMIT_WINDOW_SECONDS:.0f}s for this machine_id"
-            ),
-        )
+    _enforce_tenant_rate_limit(tenant, route="metrics")
 
     item = payload.model_dump(mode="json")
     item["tenant_id"] = tenant.tenant_id
@@ -621,6 +650,10 @@ def ingest_metrics(
         "machine_id": payload.machine_id,
         "metric_count": len(payload.metrics),
         "queued": depth,
+        "rate_limit": ingest_rate_limiter.snapshot(
+            tenant_rate_key(tenant.tenant_id),
+            max_requests=tenant.rate_limit_max,
+        ),
     }
 
 

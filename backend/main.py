@@ -1,9 +1,10 @@
 """
-InsightNode API — metrics + Phase 4 logs (Phase 4 complete).
+InsightNode API — metrics, logs, and Phase 5 Day 1 tracing infra.
 
-Architecture:
-    Metrics: Kafka → workers → PostgreSQL + ClickHouse.
-    Logs:    POST /logs + GET /logs/search; agent/API/worker structured shipping.
+Architecture (Phase 5 Day 1):
+    Metrics + logs unchanged.
+    Jaeger is up (OTLP :4318, UI :16686); TracerProvider exports a bootstrap span.
+    Route / worker instrumentation lands Day 2+.
 """
 
 from datetime import datetime
@@ -55,6 +56,11 @@ from backend.rate_limit import (
     ingest_rate_limiter,
 )
 from backend import logship as backend_logship
+from backend.tracing import (
+    ping as jaeger_ping,
+    setup_tracing,
+    shutdown_tracing,
+)
 
 logger = logging.getLogger(__name__)
 kafka_producer = None  # set in lifespan
@@ -66,14 +72,12 @@ EMBEDDED_WORKER = os.getenv("EMBEDDED_WORKER", "0") == "1"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    API lifespan: Kafka + ClickHouse + OpenSearch bootstrap; optional embedded worker.
+    API lifespan: Kafka + ClickHouse + OpenSearch + tracing bootstrap.
 
     Logic:
-        - ensure_topics() so produce never hits UNKNOWN_TOPIC on first boot.
-        - ensure_clickhouse_schema() so insightnode.metrics exists.
-        - ensure_opensearch_index() so insightnode-logs exists.
-        - Create a process-wide KafkaProducer.
-        - If EMBEDDED_WORKER=1, spawn in-process worker thread.
+        - ensure_topics / ClickHouse schema / OpenSearch index.
+        - setup_tracing() → OTLP exporter to Jaeger (Phase 5 Day 1).
+        - Optional embedded Kafka worker.
     """
     global kafka_producer
 
@@ -86,6 +90,11 @@ async def lifespan(app: FastAPI):
 
     ensure_opensearch_index()
     logger.info("OpenSearch logs index ready")
+
+    if setup_tracing():
+        logger.info("OpenTelemetry tracing ready")
+    else:
+        logger.info("OpenTelemetry tracing skipped")
 
     stop_event = None
     worker_thread = None
@@ -123,9 +132,10 @@ async def lifespan(app: FastAPI):
 
     close_clickhouse()
     close_opensearch()
+    shutdown_tracing()
 
 
-app = FastAPI(title="InsightNode", version="0.7.0", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.8.0", lifespan=lifespan)
 
 class Metric(BaseModel):
     """Single metric reading inside an ingestion payload (name, value, unit)."""
@@ -271,6 +281,7 @@ def health_check():
         "kafka_ok": kafka_ping(),
         "clickhouse_ok": clickhouse_ping(),
         "opensearch_ok": opensearch_ping(),
+        "jaeger_ok": jaeger_ping(),
         "queue_backend": "kafka",
         "queue_size": approximate_lag(),
         "queue_maxsize": QUEUE_MAX_LENGTH,

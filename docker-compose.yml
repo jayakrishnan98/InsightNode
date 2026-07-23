@@ -79,6 +79,26 @@ services:
       retries: 20
       start_period: 30s
 
+  # Phase 5 Day 1 — distributed tracing (Jaeger all-in-one + OTLP)
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: insightnode-jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      # Listen on all interfaces so the host / other containers can export OTLP.
+      - COLLECTOR_OTLP_GRPC_HOST_PORT=0.0.0.0:4317
+      - COLLECTOR_OTLP_HTTP_HOST_PORT=0.0.0.0:4318
+    ports:
+      - "16686:16686" # Jaeger UI
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:14269/ >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+
 volumes:
   clickhouse_data:
   opensearch_data:

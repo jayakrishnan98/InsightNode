@@ -157,7 +157,11 @@ See [phase-4-graduation.md](phase-4-graduation.md).
 
 ### Phase 5 — Traces
 
-- **OpenTelemetry** + Jaeger concepts
+- **Day 1:** Jaeger all-in-one (OTLP + UI) + TracerProvider bootstrap
+- **Day 2:** Instrument FastAPI HTTP requests
+- **Day 3:** Propagate context across Kafka (agent → API → worker)
+- **Day 4:** Manual spans for dual-write / logship
+- **Day 5:** Docs + graduation
 
 ### Phase 6 — Production SaaS concerns
 

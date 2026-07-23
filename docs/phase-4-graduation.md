@@ -1,7 +1,7 @@
 # Phase 4 Graduation Checklist
 
 **Completed:** Phase 4 Day 5  
-**Next:** Phase 5 — OpenTelemetry + traces (Jaeger concepts)
+**Next:** Phase 5 Day 1 — Jaeger + OpenTelemetry (traces)
 
 ---
 

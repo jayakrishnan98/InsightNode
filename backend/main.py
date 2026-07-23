@@ -13,7 +13,7 @@ import os
 import statistics
 import time
 
-from fastapi import Depends, FastAPI, Query, HTTPException
+from fastapi import Depends, FastAPI, Query, HTTPException, Request, Response, Header
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -73,6 +73,22 @@ from backend.tracing import (
     setup_tracing,
     shutdown_tracing,
 )
+from backend import metrics_prom
+from backend.alerts import (
+    count_open_alerts,
+    ensure_alert_events_schema,
+    list_alert_events,
+    process_grafana_webhook,
+    verify_webhook_secret,
+)
+from backend.hosts import (
+    DEFAULT_ACTIVE_WITHIN_SECONDS,
+    GRAFANA_PUBLIC_URL,
+    fleet_counts,
+    get_host,
+    grafana_dashboard_url,
+    list_hosts,
+)
 
 logger = logging.getLogger(__name__)
 kafka_producer = None  # set in lifespan
@@ -106,6 +122,7 @@ async def lifespan(app: FastAPI):
 
     ensure_tenants_schema_and_seed()
     ensure_metrics_tenant_isolation()
+    ensure_alert_events_schema()
     logger.info("Tenants registry ready (default=%s strict=%s)", DEFAULT_TENANT_ID, TENANCY_STRICT)
 
     if setup_tracing():
@@ -152,11 +169,300 @@ async def lifespan(app: FastAPI):
     shutdown_tracing()
 
 
-app = FastAPI(title="InsightNode", version="0.11.0", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.14.0", lifespan=lifespan)
 
 # Phase 5 Day 2: instrument BEFORE the ASGI server starts (cannot add middleware later).
 if setup_tracing():
     instrument_fastapi(app)
+
+
+@app.middleware("http")
+async def prometheus_http_middleware(request: Request, call_next):
+    """Record HTTP request count and latency (excludes the scrape endpoint itself)."""
+    if request.url.path == "/prometheus":
+        return await call_next(request)
+
+    start = time.perf_counter()
+    response = await call_next(request)
+    elapsed = time.perf_counter() - start
+
+    route = request.scope.get("route")
+    path = getattr(route, "path", None) or request.url.path
+    method = request.method
+    status = str(response.status_code)
+
+    metrics_prom.HTTP_REQUESTS.labels(method=method, path=path, status=status).inc()
+    metrics_prom.HTTP_DURATION.labels(method=method, path=path).observe(elapsed)
+    return response
+
+
+@app.get("/prometheus")
+def prometheus_metrics():
+    """
+    Prometheus scrape endpoint for API process metrics.
+
+    Path is /prometheus because /metrics is the telemetry ingest/query API.
+    """
+    body, content_type = metrics_prom.prometheus_response_body(
+        lag_fn=approximate_lag,
+        dlq_fn=dlq_size_estimate,
+    )
+    return Response(content=body, media_type=content_type)
+
+
+class AlertEventOut(BaseModel):
+    """One stored alert event (Grafana webhook persistence)."""
+    id: int
+    tenant_id: str
+    fingerprint: str
+    rule_name: str
+    status: str
+    severity: str | None = None
+    machine_id: str | None = None
+    metric_name: str | None = None
+    summary: str | None = None
+    starts_at: datetime
+    ends_at: datetime | None = None
+    created_at: datetime
+
+
+class AlertEventsResponse(BaseModel):
+    count: int
+    alerts: list[AlertEventOut]
+
+
+@app.post("/alert-events/webhook")
+def grafana_alert_webhook(
+    payload: dict[str, Any],
+    db: Session = Depends(get_db),
+    authorization: str | None = Header(default=None),
+):
+    """
+    Receive Grafana Unified Alerting webhook notifications.
+
+    Auth: Authorization: Bearer <GRAFANA_WEBHOOK_SECRET> (not X-API-Key).
+    Dedupes firing alerts on (fingerprint, starts_at); resolves update the same row.
+    """
+    if not verify_webhook_secret(authorization):
+        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+
+    counts = process_grafana_webhook(db, payload)
+    return {"status": "ok", **counts}
+
+
+@app.get("/alert-events", response_model=AlertEventsResponse)
+def get_alert_events(
+    status: str | None = Query(
+        None,
+        pattern="^(firing|resolved)$",
+        description="Filter by alert status",
+    ),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    tenant: TenantContext = Depends(require_tenant),
+    db: Session = Depends(get_db),
+):
+    """List recent alert events for the authenticated tenant (verification + UI)."""
+    rows = list_alert_events(
+        db,
+        tenant_id=tenant.tenant_id,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+    alerts = [
+        AlertEventOut(
+            id=row.id,
+            tenant_id=row.tenant_id,
+            fingerprint=row.fingerprint,
+            rule_name=row.rule_name,
+            status=row.status,
+            severity=row.severity,
+            machine_id=row.machine_id,
+            metric_name=row.metric_name,
+            summary=row.summary,
+            starts_at=row.starts_at,
+            ends_at=row.ends_at,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+    return AlertEventsResponse(count=len(alerts), alerts=alerts)
+
+
+class HostLatestMetrics(BaseModel):
+    cpu_usage: float | None = None
+    memory_usage: float | None = None
+    disk_usage: float | None = None
+
+
+class HostSummary(BaseModel):
+    machine_id: str
+    last_seen: datetime
+    status: Literal["online", "offline"]
+    latest: HostLatestMetrics
+
+
+class HostsResponse(BaseModel):
+    count: int
+    active_within_seconds: int
+    hosts: list[HostSummary]
+
+
+class LogSearchHit(BaseModel):
+    """One hit from GET /logs/search (also used on host detail)."""
+    event_id: str
+    tenant_id: str | None = None
+    machine_id: str
+    service: str
+    level: str
+    message: str
+    timestamp: datetime | str
+    attrs: dict[str, Any] = Field(default_factory=dict)
+    score: float | None = None
+
+
+class HostDetailResponse(HostSummary):
+    grafana_url: str
+    recent_warn_logs: list[LogSearchHit] = Field(default_factory=list)
+
+
+class SystemSummaryResponse(BaseModel):
+    active_hosts: int
+    offline_hosts: int
+    open_alerts: int
+    latest_metric_at: datetime | None = None
+    kafka_lag_total: int
+    grafana_url: str
+    active_within_seconds: int
+
+
+@app.get("/hosts", response_model=HostsResponse)
+def get_hosts(
+    active_within_seconds: int = Query(
+        DEFAULT_ACTIVE_WITHIN_SECONDS,
+        ge=30,
+        le=86400,
+        description="Hosts with last_seen within this window are online",
+    ),
+    tenant: TenantContext = Depends(require_tenant),
+):
+    """
+    Derive host inventory from ClickHouse metrics (no separate hosts table).
+
+    Each machine_id gets last_seen, online/offline status, and latest gauges.
+    """
+    try:
+        rows = list_hosts(
+            tenant_id=tenant.tenant_id,
+            active_within_seconds=active_within_seconds,
+        )
+    except Exception:
+        logger.exception("ClickHouse hosts list failed")
+        raise HTTPException(status_code=503, detail="ClickHouse hosts query failed")
+
+    hosts = [
+        HostSummary(
+            machine_id=h["machine_id"],
+            last_seen=h["last_seen"],
+            status=h["status"],
+            latest=HostLatestMetrics(**h["latest"]),
+        )
+        for h in rows
+    ]
+    return HostsResponse(
+        count=len(hosts),
+        active_within_seconds=active_within_seconds,
+        hosts=hosts,
+    )
+
+
+@app.get("/hosts/{machine_id}", response_model=HostDetailResponse)
+def get_host_detail(
+    machine_id: str,
+    active_within_seconds: int = Query(
+        DEFAULT_ACTIVE_WITHIN_SECONDS,
+        ge=30,
+        le=86400,
+    ),
+    tenant: TenantContext = Depends(require_tenant),
+):
+    """
+    Host detail: latest gauges + recent warn logs + Grafana deep link.
+
+    OS / agent_version are not returned — the agent does not send them yet.
+    """
+    try:
+        host = get_host(
+            tenant_id=tenant.tenant_id,
+            machine_id=machine_id,
+            active_within_seconds=active_within_seconds,
+        )
+    except Exception:
+        logger.exception("ClickHouse host detail failed machine=%s", machine_id)
+        raise HTTPException(status_code=503, detail="ClickHouse host query failed")
+
+    if host is None:
+        raise HTTPException(status_code=404, detail="Host not found")
+
+    recent_warn_logs: list[LogSearchHit] = []
+    try:
+        search = opensearch_search_logs(
+            tenant_id=tenant.tenant_id,
+            machine_id=machine_id,
+            level="warn",
+            limit=10,
+            offset=0,
+        )
+        for item in search.get("logs") or []:
+            recent_warn_logs.append(LogSearchHit(**item))
+    except Exception:
+        logger.warning(
+            "OpenSearch recent warn logs unavailable for machine=%s",
+            machine_id,
+            exc_info=True,
+        )
+
+    return HostDetailResponse(
+        machine_id=host["machine_id"],
+        last_seen=host["last_seen"],
+        status=host["status"],
+        latest=HostLatestMetrics(**host["latest"]),
+        grafana_url=grafana_dashboard_url(machine_id),
+        recent_warn_logs=recent_warn_logs,
+    )
+
+
+@app.get("/system/summary", response_model=SystemSummaryResponse)
+def get_system_summary(
+    active_within_seconds: int = Query(
+        DEFAULT_ACTIVE_WITHIN_SECONDS,
+        ge=30,
+        le=86400,
+    ),
+    tenant: TenantContext = Depends(require_tenant),
+    db: Session = Depends(get_db),
+):
+    """Overview cards: host counts, open alerts, ingest lag, Grafana link."""
+    try:
+        counts = fleet_counts(
+            tenant_id=tenant.tenant_id,
+            active_within_seconds=active_within_seconds,
+        )
+    except Exception:
+        logger.exception("ClickHouse fleet summary failed")
+        raise HTTPException(status_code=503, detail="ClickHouse summary query failed")
+
+    return SystemSummaryResponse(
+        active_hosts=counts["active_hosts"],
+        offline_hosts=counts["offline_hosts"],
+        open_alerts=count_open_alerts(db, tenant_id=tenant.tenant_id),
+        latest_metric_at=counts["latest_metric_at"],
+        kafka_lag_total=approximate_lag(),
+        grafana_url=GRAFANA_PUBLIC_URL.rstrip("/"),
+        active_within_seconds=active_within_seconds,
+    )
+
 
 class Metric(BaseModel):
     """Single metric reading inside an ingestion payload (name, value, unit)."""
@@ -265,19 +571,6 @@ class LogsIngestResponse(BaseModel):
     status: str
     indexed: int
     ids: list[str]
-
-
-class LogSearchHit(BaseModel):
-    """One hit from GET /logs/search."""
-    event_id: str
-    tenant_id: str | None = None
-    machine_id: str
-    service: str
-    level: str
-    message: str
-    timestamp: datetime | str
-    attrs: dict[str, Any] = Field(default_factory=dict)
-    score: float | None = None
 
 
 class LogsSearchResponse(BaseModel):
@@ -636,17 +929,26 @@ def ingest_metrics(
         share one sliding window (not one window per machine).
     """
     if kafka_producer is None:
+        metrics_prom.INGEST_REJECTED.labels(reason="producer_not_ready").inc()
         raise HTTPException(status_code=503, detail="Kafka producer not ready")
 
-    _enforce_tenant_rate_limit(tenant, route="metrics")
+    try:
+        _enforce_tenant_rate_limit(tenant, route="metrics")
+    except HTTPException:
+        metrics_prom.INGEST_REJECTED.labels(reason="rate_limit").inc()
+        raise
 
     point_count = len(payload.metrics)
-    check_quota(
-        tenant_id=tenant.tenant_id,
-        quotas=tenant.quotas,
-        metric_events=1,
-        metric_points=point_count,
-    )
+    try:
+        check_quota(
+            tenant_id=tenant.tenant_id,
+            quotas=tenant.quotas,
+            metric_events=1,
+            metric_points=point_count,
+        )
+    except HTTPException:
+        metrics_prom.INGEST_REJECTED.labels(reason="quota").inc()
+        raise
 
     item = payload.model_dump(mode="json")
     item["tenant_id"] = tenant.tenant_id
@@ -663,6 +965,7 @@ def ingest_metrics(
             event_id=payload.event_id,
             queue_maxsize=QUEUE_MAX_LENGTH,
         )
+        metrics_prom.INGEST_REJECTED.labels(reason="queue_full").inc()
         raise HTTPException(
             status_code=503,
             detail="Ingest queue full, try again later",
@@ -675,6 +978,8 @@ def ingest_metrics(
     )
 
     depth = approximate_lag()
+    metrics_prom.INGEST_ACCEPTED.inc()
+    metrics_prom.KAFKA_LAG.set(depth)
     logger.info(
         "Enqueued metrics tenant=%s machine=%s metric_count=%s lag=%s",
         tenant.tenant_id,

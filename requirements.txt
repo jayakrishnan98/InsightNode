@@ -14,3 +14,4 @@ opentelemetry-exporter-otlp-proto-http==1.27.0
 opentelemetry-instrumentation-fastapi==0.48b0
 opentelemetry-instrumentation-asgi==0.48b0
 setuptools==70.3.0
+prometheus_client==0.21.1

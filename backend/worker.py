@@ -49,6 +49,7 @@ from backend.tracing import (
     setup_tracing,
     shutdown_tracing,
 )
+from backend import metrics_prom
 
 logger = logging.getLogger(__name__)
 
@@ -125,20 +126,33 @@ def _flush_batch(db: Session, batch: list[dict]) -> None:
             "db.postgres.insert",
             attributes={"db.system": "postgresql", "insightnode.row_count": len(rows)},
         ) as pg_span:
-            stmt = insert(MetricRecord).values(rows)
-            stmt = stmt.on_conflict_do_nothing(
-                index_elements=["tenant_id", "machine_id", "event_id", "metric_name"],
-                index_where=text("event_id IS NOT NULL"),
-            )
-            result = db.execute(stmt)
-            db.commit()
-            pg_span.set_attribute("insightnode.pg_new_rows", int(result.rowcount or 0))
+            try:
+                stmt = insert(MetricRecord).values(rows)
+                stmt = stmt.on_conflict_do_nothing(
+                    index_elements=["tenant_id", "machine_id", "event_id", "metric_name"],
+                    index_where=text("event_id IS NOT NULL"),
+                )
+                result = db.execute(stmt)
+                db.commit()
+                pg_span.set_attribute(
+                    "insightnode.pg_new_rows", int(result.rowcount or 0)
+                )
+            except Exception:
+                metrics_prom.WORKER_DUAL_WRITE_FAILURES.labels(store="postgres").inc()
+                raise
 
         with manual_span(
             "db.clickhouse.insert",
             attributes={"db.system": "clickhouse", "insightnode.row_count": len(rows)},
         ):
-            insert_clickhouse_metrics(rows)
+            try:
+                insert_clickhouse_metrics(rows)
+            except Exception:
+                metrics_prom.WORKER_DUAL_WRITE_FAILURES.labels(store="clickhouse").inc()
+                raise
+
+    metrics_prom.WORKER_DUAL_WRITE_SUCCESS.inc()
+    metrics_prom.WORKER_BATCHES.inc()
 
     logger.info(
         "Persisted batch: %s row(s) submitted, %s new in PG (+ ClickHouse)",
@@ -346,6 +360,8 @@ def main() -> None:
         service_name=os.getenv("OTEL_SERVICE_NAME", "insightnode-worker")
     )
 
+    metrics_server = metrics_prom.start_worker_metrics_server()
+
     stop_event = threading.Event()
     consumer_name = default_consumer_name()
 
@@ -364,6 +380,8 @@ def main() -> None:
     try:
         run_ingest_worker(stop_event, consumer_name=consumer_name)
     finally:
+        if metrics_server is not None:
+            metrics_server.shutdown()
         shutdown_tracing()
 
 

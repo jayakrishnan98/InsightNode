@@ -1,0 +1,15 @@
+# Grafana Unified Alerting — contact point → InsightNode webhook
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: insightnode-webhook
+    receivers:
+      - uid: insightnode-webhook-receiver
+        type: webhook
+        settings:
+          url: http://host.docker.internal:8001/alert-events/webhook
+          httpMethod: POST
+          maxAlerts: 10
+        secureSettings:
+          authorization_credentials: ${GRAFANA_WEBHOOK_SECRET}

@@ -99,12 +99,36 @@ services:
       retries: 20
       start_period: 10s
 
+  # Phase 7 — scrape API/worker process metrics (host processes via host.docker.internal)
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: insightnode-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:9090/-/healthy >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
   # Phase 7 — Grafana for operational metrics (ClickHouse primary, Postgres optional)
   grafana:
     image: grafana/grafana:11.2.0
     container_name: insightnode-grafana
     depends_on:
       clickhouse:
+        condition: service_healthy
+      prometheus:
         condition: service_healthy
     ports:
       - "3000:3000"
@@ -125,6 +149,8 @@ services:
       - POSTGRES_USER=${POSTGRES_USER:-insightnode}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-insightnode}
       - POSTGRES_DATABASE=${POSTGRES_DATABASE:-insightnode}
+      # Webhook contact point auth (must match API GRAFANA_WEBHOOK_SECRET)
+      - GRAFANA_WEBHOOK_SECRET=${GRAFANA_WEBHOOK_SECRET:-dev-webhook-secret}
     volumes:
       - grafana_data:/var/lib/grafana
       - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -142,3 +168,4 @@ volumes:
   clickhouse_data:
   opensearch_data:
   grafana_data:
+  prometheus_data:

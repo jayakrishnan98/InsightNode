@@ -19,6 +19,16 @@ datasources:
     secureJsonData:
       password: ${CLICKHOUSE_PASSWORD}
 
+  - name: Prometheus
+    uid: insightnode-prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: false
+    editable: false
+    jsonData:
+      timeInterval: 15s
+
   # Optional — Postgres runs on the host (not in Compose). Useful for relational
   # metadata later; ClickHouse remains the default for time-series panels.
   - name: PostgreSQL

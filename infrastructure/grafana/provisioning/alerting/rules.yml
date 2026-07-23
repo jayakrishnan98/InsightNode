@@ -1,0 +1,222 @@
+# Threshold + no-data rules for host gauges (ClickHouse).
+# Thresholds match agent defaults (CPU 90 / memory 85 / disk 80).
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: insightnode-infrastructure
+    folder: InsightNode
+    interval: 1m
+    rules:
+      - uid: insightnode-high-cpu
+        title: High CPU usage
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: insightnode-clickhouse
+            model:
+              editorType: sql
+              format: 1
+              intervalMs: 15000
+              maxDataPoints: 43200
+              queryType: sql
+              rawSql: >
+                SELECT
+                  $__timeInterval(timestamp) AS time,
+                  avg(value) AS cpu_avg
+                FROM insightnode.metrics
+                WHERE tenant_id = 'local'
+                  AND metric_name = 'cpu_usage'
+                  AND $__timeFilter(timestamp)
+                GROUP BY time
+                ORDER BY time ASC
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              expression: A
+              reducer: last
+              refId: B
+              type: reduce
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [90], type: gt }
+                  operator: { type: and }
+                  query: { params: ["C"] }
+                  reducer: { params: [], type: last }
+                  type: query
+              expression: B
+              refId: C
+              type: threshold
+        noDataState: NoData
+        execErrState: Error
+        for: 2m
+        annotations:
+          summary: CPU usage above 90%
+          description: Fleet average CPU exceeded 90% for 2 minutes.
+        labels:
+          severity: warning
+          metric_name: cpu_usage
+        isPaused: false
+
+      - uid: insightnode-high-memory
+        title: High memory usage
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: insightnode-clickhouse
+            model:
+              editorType: sql
+              format: 1
+              intervalMs: 15000
+              maxDataPoints: 43200
+              queryType: sql
+              rawSql: >
+                SELECT
+                  $__timeInterval(timestamp) AS time,
+                  avg(value) AS memory_avg
+                FROM insightnode.metrics
+                WHERE tenant_id = 'local'
+                  AND metric_name = 'memory_usage'
+                  AND $__timeFilter(timestamp)
+                GROUP BY time
+                ORDER BY time ASC
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              expression: A
+              reducer: last
+              refId: B
+              type: reduce
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [85], type: gt }
+                  operator: { type: and }
+                  query: { params: ["C"] }
+                  reducer: { params: [], type: last }
+                  type: query
+              expression: B
+              refId: C
+              type: threshold
+        noDataState: NoData
+        execErrState: Error
+        for: 2m
+        annotations:
+          summary: Memory usage above 85%
+        labels:
+          severity: warning
+          metric_name: memory_usage
+        isPaused: false
+
+      - uid: insightnode-high-disk
+        title: High disk usage
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: insightnode-clickhouse
+            model:
+              editorType: sql
+              format: 1
+              intervalMs: 15000
+              maxDataPoints: 43200
+              queryType: sql
+              rawSql: >
+                SELECT
+                  $__timeInterval(timestamp) AS time,
+                  avg(value) AS disk_avg
+                FROM insightnode.metrics
+                WHERE tenant_id = 'local'
+                  AND metric_name = 'disk_usage'
+                  AND $__timeFilter(timestamp)
+                GROUP BY time
+                ORDER BY time ASC
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              expression: A
+              reducer: last
+              refId: B
+              type: reduce
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [80], type: gt }
+                  operator: { type: and }
+                  query: { params: ["C"] }
+                  reducer: { params: [], type: last }
+                  type: query
+              expression: B
+              refId: C
+              type: threshold
+        noDataState: NoData
+        execErrState: Error
+        for: 5m
+        annotations:
+          summary: Disk usage above 80%
+        labels:
+          severity: warning
+          metric_name: disk_usage
+        isPaused: false
+
+      - uid: insightnode-host-silent
+        title: Host not reporting
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: insightnode-clickhouse
+            model:
+              editorType: sql
+              format: 1
+              intervalMs: 15000
+              maxDataPoints: 43200
+              queryType: sql
+              rawSql: >
+                SELECT
+                  $__timeInterval(timestamp) AS time,
+                  count() AS samples
+                FROM insightnode.metrics
+                WHERE tenant_id = 'local'
+                  AND metric_name = 'cpu_usage'
+                  AND $__timeFilter(timestamp)
+                GROUP BY time
+                ORDER BY time ASC
+              refId: A
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              expression: A
+              reducer: last
+              refId: B
+              type: reduce
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - evaluator: { params: [1], type: lt }
+                  operator: { type: and }
+                  query: { params: ["C"] }
+                  reducer: { params: [], type: last }
+                  type: query
+              expression: B
+              refId: C
+              type: threshold
+        noDataState: Alerting
+        execErrState: Error
+        for: 2m
+        annotations:
+          summary: No CPU metrics received for 2 minutes
+        labels:
+          severity: critical
+          metric_name: cpu_usage
+        isPaused: false

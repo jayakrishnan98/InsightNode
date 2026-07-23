@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # FastAPI process metrics (/prometheus — /metrics is the ingest API).
+  - job_name: insightnode-api
+    metrics_path: /prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8001"]
+        labels:
+          service: insightnode-api
+
+  # Standalone worker exposes the same registry on WORKER_METRICS_PORT (default 8002).
+  - job_name: insightnode-worker
+    metrics_path: /prometheus
+    static_configs:
+      - targets: ["host.docker.internal:8002"]
+        labels:
+          service: insightnode-worker

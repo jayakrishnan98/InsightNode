@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 5 Day 1 — Jaeger + OpenTelemetry up**  
-**Next: Phase 5 Day 2 — instrument FastAPI HTTP spans**
+**Current stage: Phase 5 Day 2 — FastAPI HTTP spans**  
+**Next: Phase 5 Day 3 — propagate trace context over Kafka**
 
-Phase 5 Day 1 adds Jaeger (OTLP + UI) and a TracerProvider that exports a bootstrap span. Route instrumentation starts Day 2.
+Phase 5 Day 2 auto-instruments FastAPI so each HTTP request (except health/docs) appears as a server span in Jaeger.
 
 ---
 
@@ -43,7 +43,7 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
 | **Agent resilience** | Retries + on-disk spool |
 | **ClickHouse** | Columnar analytics store (Phase 3 complete) |
 | **OpenSearch** | Centralized logs — ingest, search, agent/API/worker shipping (Phase 4 complete) |
-| **Jaeger (Day 1)** | OTLP collector + UI; TracerProvider bootstrap span |
+| **Jaeger (Day 2)** | OTLP + UI; FastAPI HTTP server spans per request |
 
 ---
 
@@ -63,7 +63,7 @@ InsightNode/
 │   ├── clickhouse_client.py # Phase 3 — connect, insert, aggregate
 │   ├── opensearch_client.py # Phase 4 — index, get, search
 │   ├── logship.py           # Phase 4 Day 4 — API/worker → OpenSearch
-│   ├── tracing.py           # Phase 5 Day 1 — OTEL → Jaeger
+│   ├── tracing.py           # Phase 5 — OTEL setup + FastAPI instrumentation
 │   ├── postgres_aggregate.py# Phase 3 Day 4 — PG aggregate for compare
 │   ├── rate_limit.py        # Phase 2 Day 6 ingest rate limit
 │   ├── redis_client.py      # Phase 2 Days 1–4 (history)
@@ -212,7 +212,7 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
-> See [docs/phase-5-architecture.md](docs/phase-5-architecture.md) for OpenTelemetry Day 1.
+> See [docs/phase-5-architecture.md](docs/phase-5-architecture.md) for OpenTelemetry (Days 1–2).
 > See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) and [docs/phase-4-graduation.md](docs/phase-4-graduation.md).
 > See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) and [docs/phase-3-graduation.md](docs/phase-3-graduation.md).
 > See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).

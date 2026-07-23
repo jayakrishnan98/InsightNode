@@ -1,10 +1,10 @@
 """
-InsightNode API — metrics, logs, and Phase 5 Day 1 tracing infra.
+InsightNode API — metrics, logs, and Phase 5 Day 2 HTTP tracing.
 
-Architecture (Phase 5 Day 1):
+Architecture (Phase 5 Day 2):
     Metrics + logs unchanged.
-    Jaeger is up (OTLP :4318, UI :16686); TracerProvider exports a bootstrap span.
-    Route / worker instrumentation lands Day 2+.
+    Each HTTP request (except health/docs) becomes a Jaeger server span.
+    Kafka context propagation lands Day 3.
 """
 
 from datetime import datetime
@@ -57,6 +57,7 @@ from backend.rate_limit import (
 )
 from backend import logship as backend_logship
 from backend.tracing import (
+    instrument_fastapi,
     ping as jaeger_ping,
     setup_tracing,
     shutdown_tracing,
@@ -76,7 +77,8 @@ async def lifespan(app: FastAPI):
 
     Logic:
         - ensure_topics / ClickHouse schema / OpenSearch index.
-        - setup_tracing() → OTLP exporter to Jaeger (Phase 5 Day 1).
+        - setup_tracing() in lifespan (idempotent if already done at import).
+        - FastAPI instrumentation is applied at import time (Day 2).
         - Optional embedded Kafka worker.
     """
     global kafka_producer
@@ -135,7 +137,11 @@ async def lifespan(app: FastAPI):
     shutdown_tracing()
 
 
-app = FastAPI(title="InsightNode", version="0.8.0", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.8.1", lifespan=lifespan)
+
+# Phase 5 Day 2: instrument BEFORE the ASGI server starts (cannot add middleware later).
+if setup_tracing():
+    instrument_fastapi(app)
 
 class Metric(BaseModel):
     """Single metric reading inside an ingestion payload (name, value, unit)."""

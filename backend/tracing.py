@@ -1,14 +1,16 @@
 """
 OpenTelemetry tracing for Phase 5.
 
-Day 1: configure TracerProvider + OTLP HTTP exporter → Jaeger; health ping.
-Day 2+: FastAPI / agent / worker instrumentation (not yet).
+Day 1: TracerProvider + OTLP HTTP exporter → Jaeger; health ping.
+Day 2: FastAPI HTTP auto-instrumentation (one span per request).
+Day 3+: Kafka context propagation / manual spans (not yet).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from typing import TYPE_CHECKING
 
 import httpx
 from opentelemetry import trace
@@ -16,6 +18,9 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +33,14 @@ OTEL_EXPORTER_OTLP_ENDPOINT = os.getenv(
 JAEGER_UI_URL = os.getenv("JAEGER_UI_URL", "http://localhost:16686")
 JAEGER_ADMIN_URL = os.getenv("JAEGER_ADMIN_URL", "http://localhost:14269")
 
+# Skip noisy / ops endpoints in the Jaeger UI (Day 2).
+EXCLUDED_URLS = os.getenv(
+    "OTEL_EXCLUDED_URLS",
+    "health,docs,openapi.json,redoc,favicon.ico",
+)
+
 _provider: TracerProvider | None = None
+_fastapi_instrumented = False
 
 
 def setup_tracing(service_name: str | None = None) -> bool:
@@ -73,12 +85,51 @@ def setup_tracing(service_name: str | None = None) -> bool:
     tracer = trace.get_tracer("insightnode.tracing")
     with tracer.start_as_current_span("startup.bootstrap") as span:
         span.set_attribute("insightnode.phase", "5")
-        span.set_attribute("insightnode.day", "1")
+        span.set_attribute("insightnode.day", "2")
 
     logger.info(
         "OpenTelemetry tracing ready service=%s otlp=%s",
         name,
         endpoint,
+    )
+    return True
+
+
+def instrument_fastapi(app: "FastAPI") -> bool:
+    """
+    Wrap the FastAPI app so each HTTP request becomes a server span (Phase 5 Day 2).
+
+    Logic:
+        - Requires setup_tracing() first (shared TracerProvider).
+        - FastAPIInstrumentor creates spans named like GET /metrics.
+        - Excludes health/docs by default to keep the UI readable.
+
+    Reason:
+        Auto-instrumentation teaches the request→span model before we add
+        Kafka propagation (Day 3) or manual dual-write spans (Day 4).
+        Must be called at import time (after `app = FastAPI(...)`) — Starlette
+        forbids adding middleware once the application has started.
+    """
+    global _fastapi_instrumented
+
+    if not OTEL_ENABLED:
+        return False
+    if _provider is None:
+        logger.warning("instrument_fastapi called before setup_tracing — skipping")
+        return False
+    if _fastapi_instrumented:
+        return True
+
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+    FastAPIInstrumentor.instrument_app(
+        app,
+        excluded_urls=EXCLUDED_URLS,
+    )
+    _fastapi_instrumented = True
+    logger.info(
+        "FastAPI OpenTelemetry instrumentation enabled excluded_urls=%s",
+        EXCLUDED_URLS,
     )
     return True
 
@@ -103,7 +154,7 @@ def ping() -> bool:
 
 def shutdown_tracing() -> None:
     """Flush and shut down the TracerProvider (API lifespan)."""
-    global _provider
+    global _provider, _fastapi_instrumented
     if _provider is None:
         return
     try:
@@ -113,4 +164,5 @@ def shutdown_tracing() -> None:
         logger.exception("OpenTelemetry shutdown failed")
     finally:
         _provider = None
+        _fastapi_instrumented = False
         logger.info("OpenTelemetry tracing shut down")

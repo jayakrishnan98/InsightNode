@@ -4,8 +4,8 @@ Phase 5 adds **distributed tracing**: follow one request/work unit across API �
 
 ```
 Phase 4:  logs → OpenSearch
-Day 1:    + Jaeger up (OTLP + UI) + TracerProvider bootstrap   ← YOU ARE HERE
-Day 2:    Instrument FastAPI HTTP requests (auto spans)
+Day 1:    + Jaeger up (OTLP + UI) + TracerProvider bootstrap
+Day 2:    Instrument FastAPI HTTP requests (auto spans)   ← YOU ARE HERE
 Day 3:    Propagate context across Kafka (agent → API → worker)
 Day 4:    Manual spans for dual-write / logship + event_id attrs
 Day 5:    Docs + graduation
@@ -13,23 +13,41 @@ Day 5:    Docs + graduation
 
 ---
 
-## Current architecture (Day 1)
+## Current architecture (Day 2)
 
 ```mermaid
 flowchart LR
-  API[FastAPI] -->|OTLP HTTP :4318| Jaeger[(Jaeger all-in-one)]
+  Client -->|HTTP| API[FastAPI]
+  API -->|server span per request| API
+  API -->|OTLP :4318| Jaeger[(Jaeger)]
   Jaeger -->|UI :16686| Browser
-  API -->|GET /health jaeger_ok| Jaeger
 ```
 
-| Concept | InsightNode Day 1 |
-|---------|-------------------|
-| Trace | A tree of spans for one logical operation |
-| Span | One timed unit of work (`startup.bootstrap` today) |
-| OTLP | Wire format SDK → Jaeger collector |
-| Jaeger UI | Browse traces by `service.name` |
+| Concept | Day 2 meaning |
+|---------|----------------|
+| Server span | One span wrapping an inbound HTTP request |
+| Span name | e.g. `GET /logs/search`, `POST /metrics` |
+| Attributes | `http.method`, `http.route`, status code, … |
+| Excluded | `/health`, `/docs`, OpenAPI (less UI noise) |
 
-Day 1 deliberately does **not** instrument routes yet. First prove: SDK → OTLP → Jaeger UI.
+Each request is still a **single-service** trace. Cross-process linking (Kafka) is Day 3.
+
+---
+
+## Day 2 lesson — auto-instrumentation
+
+```
+setup_tracing()           # TracerProvider + OTLP exporter
+instrument_fastapi(app)   # ASGI middleware creates spans
+```
+
+| Approach | When |
+|----------|------|
+| Auto (Day 2) | HTTP edge — every route for free |
+| Manual (Day 4) | Dual-write, logship, custom steps |
+| Propagation (Day 3) | Same `trace_id` across API → worker |
+
+Excluded URLs (env `OTEL_EXCLUDED_URLS`): `health,docs,openapi.json,redoc,favicon.ico`
 
 ---
 
@@ -37,46 +55,30 @@ Day 1 deliberately does **not** instrument routes yet. First prove: SDK → OTLP
 
 ```bash
 docker compose up -d
-# Jaeger UI:  http://localhost:16686
-# OTLP HTTP:  http://localhost:4318
-# OTLP gRPC:  http://localhost:4317
-
-pip install -r requirements.txt
 uvicorn backend.main:app --reload --port 8001
 
-curl http://127.0.0.1:8001/health
-# expect jaeger_ok: true
+# Generate spans (not /health — excluded)
+curl "http://127.0.0.1:8001/pipeline"
+curl "http://127.0.0.1:8001/logs/search?limit=5"
 
-# In Jaeger UI → Service: insightnode-api → Find Traces
-# Look for span name: startup.bootstrap
+# Jaeger UI → Service insightnode-api → Find Traces
+open http://localhost:16686
 ```
 
-Env overrides:
+---
 
-| Variable | Default |
-|----------|---------|
-| `OTEL_ENABLED` | `1` |
-| `OTEL_SERVICE_NAME` | `insightnode-api` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` |
-| `JAEGER_UI_URL` | `http://localhost:16686` |
+## Three pillars
 
-Set `OTEL_ENABLED=0` to skip tracing.
+| Pillar | Store | Question |
+|--------|-------|----------|
+| Metrics | PG + ClickHouse | How much? |
+| Logs | OpenSearch | What message? |
+| Traces | Jaeger | Where did time go? |
 
 ---
 
-## Three pillars (where Phase 5 fits)
+## What Day 2 deliberately does not include
 
-| Pillar | Store in InsightNode | Question |
-|--------|----------------------|----------|
-| Metrics | PG + ClickHouse | How much CPU? p50 latency of aggregates? |
-| Logs | OpenSearch | What error message on host X? |
-| Traces | Jaeger | Which span was slow in this request path? |
-
----
-
-## What Day 1 deliberately does not include
-
-- FastAPI auto-instrumentation → **Day 2**
-- Trace context over Kafka / agent → **Day 3**
-- Manual dual-write spans → **Day 4**
-- OpenTelemetry Collector as a separate hop → optional later
+- Trace context in Kafka headers / agent → **Day 3**
+- Manual spans around dual-write → **Day 4**
+- Client instrumentation of `httpx` in the agent → Day 3/4

@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 4 Day 1 — OpenSearch up**  
-**Next: Phase 4 Day 2 — log ingest into OpenSearch**
+**Current stage: Phase 4 Day 2 — log ingest into OpenSearch**  
+**Next: Phase 4 Day 3 — full-text log search**
 
-Phase 3 dual-writes metrics to PostgreSQL + ClickHouse. Phase 4 Day 1 adds OpenSearch (logs index + health); log ingest/search starts Day 2.
+Phase 4 Day 2 adds `POST /logs` (bulk index into OpenSearch) and `GET /logs/{event_id}` for verification. Metrics path is unchanged.
 
 ---
 
@@ -22,12 +22,14 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
   ├── GET /metrics (PG)             └─ DLQ topic
   ├── GET /metrics/aggregate (CH)
   ├── GET /metrics/aggregate/compare
-  ├── GET /health          (+ clickhouse_ok)
+  ├── POST /logs             (OpenSearch)
+  ├── GET /logs/{event_id}
+  ├── GET /health          (+ clickhouse_ok, opensearch_ok)
   ├── GET /pipeline
   └── GET /dlq
 ```
 
-### Features (Phase 1–3)
+### Features (Phase 1–4)
 
 | Component | Capability |
 |-----------|------------|
@@ -40,7 +42,7 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
 | **Ops** | `/health` (Kafka + ClickHouse), `/pipeline` (partition lag), `/dlq` |
 | **Agent resilience** | Retries + on-disk spool |
 | **ClickHouse** | Columnar analytics store (Phase 3 complete) |
-| **OpenSearch (Day 1)** | Logs index up; ingest/search starts Day 2 |
+| **OpenSearch (Day 2)** | `POST /logs` bulk index + `GET /logs/{event_id}` |
 
 ---
 
@@ -57,7 +59,7 @@ InsightNode/
 │   ├── worker.py            # Kafka consumer → PostgreSQL + ClickHouse
 │   ├── kafka_client.py      # Phase 2 Day 5–6 Kafka helpers
 │   ├── clickhouse_client.py # Phase 3 — connect, insert, aggregate
-│   ├── opensearch_client.py # Phase 4 Day 1 — connect + ensure logs index
+│   ├── opensearch_client.py # Phase 4 — connect, index_logs, get_log
 │   ├── postgres_aggregate.py# Phase 3 Day 4 — PG aggregate for compare
 │   ├── rate_limit.py        # Phase 2 Day 6 ingest rate limit
 │   ├── redis_client.py      # Phase 2 Days 1–4 (history)
@@ -203,7 +205,7 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
-> See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) for OpenSearch Day 1.
+> See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) for OpenSearch (Days 1–2).
 > See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) and [docs/phase-3-graduation.md](docs/phase-3-graduation.md).
 > See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).
 > Redis Streams code (`backend/redis_client.py`) remains as Days 1–4 learning history.
@@ -281,6 +283,34 @@ curl "http://127.0.0.1:8001/metrics/aggregate/compare?machine_id=compare-bench&m
 |-----------------|---------|-------------|
 | `runs` | `3` | How many times to run each store |
 | `include_buckets` | `false` | Include both bucket series in the response |
+
+### `POST /logs` — Ingest structured logs (Phase 4 Day 2)
+
+Bulk-indexes log documents into OpenSearch. `event_id` is the document `_id` (re-POST overwrites).
+
+```bash
+curl -s -X POST http://127.0.0.1:8001/logs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "logs": [{
+      "event_id": "550e8400-e29b-41d4-a716-446655440000",
+      "machine_id": "my-machine",
+      "service": "agent",
+      "level": "warn",
+      "message": "disk usage high on /",
+      "timestamp": "2026-07-23T08:00:00+00:00",
+      "attrs": {"path": "/", "percent": 92}
+    }]
+  }'
+```
+
+### `GET /logs/{event_id}` — Fetch one log by id
+
+Verification helper until Day 3 search.
+
+```bash
+curl http://127.0.0.1:8001/logs/550e8400-e29b-41d4-a716-446655440000
+```
 
 ### `GET /health` — Pipeline health
 

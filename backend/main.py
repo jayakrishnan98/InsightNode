@@ -1,13 +1,14 @@
 """
-InsightNode API — ingestion and query endpoints for host metrics (and Phase 4 logs infra).
+InsightNode API — metrics + Phase 4 log ingest.
 
-Architecture (Phase 4 Day 1):
-    Metrics path unchanged (Kafka → PG + ClickHouse).
-    OpenSearch is up (logs index + health ping). Log ingest/search lands Day 2+.
+Architecture (Phase 4 Day 2):
+    Metrics: Kafka → workers → PostgreSQL + ClickHouse (unchanged).
+    Logs:    POST /logs → OpenSearch (insightnode-logs), keyed by event_id.
+    Search:  Day 3.
 """
 
 from datetime import datetime
-from typing import Optional, Literal
+from typing import Any, Optional, Literal
 import logging
 import os
 import statistics
@@ -30,6 +31,8 @@ from backend.clickhouse_client import (
 from backend.opensearch_client import (
     close_client as close_opensearch,
     ensure_index as ensure_opensearch_index,
+    get_log as opensearch_get_log,
+    index_logs as opensearch_index_logs,
     ping as opensearch_ping,
 )
 from backend.postgres_aggregate import query_aggregate as postgres_query_aggregate
@@ -121,7 +124,7 @@ async def lifespan(app: FastAPI):
     close_opensearch()
 
 
-app = FastAPI(title="InsightNode", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.6.1", lifespan=lifespan)
 
 class Metric(BaseModel):
     """Single metric reading inside an ingestion payload (name, value, unit)."""
@@ -201,6 +204,36 @@ class AggregateCompareResponse(BaseModel):
     clickhouse_buckets: list[MetricBucket] | None = None
 
 
+class LogEvent(BaseModel):
+    """One structured log line for OpenSearch (Phase 4 Day 2)."""
+    event_id: str = Field(
+        ...,
+        min_length=36,
+        max_length=36,
+        examples=["550e8400-e29b-41d4-a716-446655440000"],
+    )
+    machine_id: str = Field(..., min_length=1, examples=["Jayakrishnans-MacBook-Air.local"])
+    service: str = Field(default="unknown", min_length=1, examples=["agent"])
+    level: Literal["debug", "info", "warn", "error"] = Field(
+        default="info", examples=["info"]
+    )
+    message: str = Field(..., min_length=1, examples=["CPU sample collected"])
+    timestamp: datetime = Field(..., examples=["2026-07-23T08:00:00+00:00"])
+    attrs: dict[str, Any] = Field(default_factory=dict)
+
+
+class LogsPayload(BaseModel):
+    """Batch of log events for POST /logs."""
+    logs: list[LogEvent] = Field(..., min_length=1)
+
+
+class LogsIngestResponse(BaseModel):
+    """Result of indexing logs into OpenSearch."""
+    status: str
+    indexed: int
+    ids: list[str]
+
+
 @app.get("/health")
 def health_check():
     """
@@ -270,6 +303,52 @@ def list_dlq(limit: int = Query(20, ge=1, le=100)):
     """
     entries = peek_dlq(limit=limit)
     return {"count": len(entries), "entries": entries}
+
+
+@app.post("/logs", response_model=LogsIngestResponse, status_code=202)
+def ingest_logs(payload: LogsPayload):
+    """
+    Accept structured logs and index them into OpenSearch (Phase 4 Day 2).
+
+    Logic:
+        - Validate batch via Pydantic.
+        - Bulk-index into insightnode-logs using event_id as document _id.
+        - Return 202 with indexed count + ids.
+        - refresh=True so immediate GET /logs/{event_id} works in labs.
+
+    Reason:
+        Logs are text events, not gauges — OpenSearch is the right store.
+        Direct index (no Kafka yet) keeps Day 2 focused on the document model.
+        Day 4 can add agent shipping; a Kafka log topic can come later if needed.
+    """
+    docs = [log.model_dump(mode="json") for log in payload.logs]
+    try:
+        result = opensearch_index_logs(docs, refresh=True)
+    except Exception:
+        logger.exception("OpenSearch log ingest failed")
+        raise HTTPException(status_code=503, detail="OpenSearch log ingest failed")
+
+    if result["errors"]:
+        raise HTTPException(status_code=502, detail="OpenSearch bulk index had errors")
+
+    return LogsIngestResponse(
+        status="accepted",
+        indexed=result["indexed"],
+        ids=result["ids"],
+    )
+
+
+@app.get("/logs/{event_id}")
+def get_log_by_event_id(event_id: str):
+    """
+    Fetch one log document by event_id (OpenSearch _id).
+
+    Day 2 verification helper — full-text search arrives in Day 3.
+    """
+    doc = opensearch_get_log(event_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Log not found")
+    return doc
 
 
 @app.get("/metrics", response_model=MetricsQueryResponse)

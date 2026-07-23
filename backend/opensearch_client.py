@@ -2,7 +2,8 @@
 OpenSearch client for Phase 4.
 
 Day 1: connect, ensure logs index, health ping.
-Day 2+: ingest + search APIs (not yet).
+Day 2: index_logs() / get_log() for POST /logs ingest.
+Day 3: search (not yet).
 """
 
 from __future__ import annotations
@@ -10,9 +11,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-from opensearchpy import OpenSearch
+from opensearchpy import OpenSearch, helpers
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +95,110 @@ def ensure_index() -> None:
     body = json.loads(INDEX_BODY_PATH.read_text(encoding="utf-8"))
     client.indices.create(index=LOGS_INDEX, body=body)
     logger.info("Created OpenSearch index: %s", LOGS_INDEX)
+
+
+def _as_utc_iso(value: Any) -> str:
+    """Normalize datetime / ISO string to UTC ISO-8601 for the date field."""
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    else:
+        raise TypeError(f"Unsupported timestamp type: {type(value)!r}")
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat()
+
+
+def _normalize_doc(doc: dict[str, Any]) -> dict[str, Any]:
+    """Map an API log event into an OpenSearch _source document."""
+    event_id = str(doc["event_id"])
+    return {
+        "event_id": event_id,
+        "machine_id": doc["machine_id"],
+        "service": doc.get("service") or "unknown",
+        "level": doc.get("level") or "info",
+        "message": doc["message"],
+        "timestamp": _as_utc_iso(doc["timestamp"]),
+        "attrs": doc.get("attrs") or {},
+    }
+
+
+def index_logs(docs: list[dict[str, Any]], *, refresh: bool = False) -> dict[str, Any]:
+    """
+    Bulk-index log documents into insightnode-logs (Phase 4 Day 2).
+
+    Logic:
+        - Use event_id as document _id (idempotent re-ingest overwrites).
+        - helpers.bulk for efficient multi-doc indexing.
+        - refresh=False by default (near-real-time; index refresh_interval=1s).
+
+    Reason:
+        Logs arrive in bursts; bulk beats one HTTP round-trip per line.
+        Stable _id mirrors metrics event_id idempotency without a SQL unique index.
+    """
+    if not docs:
+        return {"indexed": 0, "errors": False, "ids": []}
+
+    actions = []
+    ids: list[str] = []
+    for raw in docs:
+        source = _normalize_doc(raw)
+        event_id = source["event_id"]
+        ids.append(event_id)
+        actions.append(
+            {
+                "_op_type": "index",
+                "_index": LOGS_INDEX,
+                "_id": event_id,
+                "_source": source,
+            }
+        )
+
+    success, errors = helpers.bulk(
+        get_client(),
+        actions,
+        refresh=refresh,
+        raise_on_error=False,
+    )
+    had_errors = bool(errors)
+    if had_errors:
+        logger.error("OpenSearch bulk index partial failure: %s", errors[:3])
+    else:
+        logger.info("OpenSearch indexed %s log(s) into %s", success, LOGS_INDEX)
+
+    return {
+        "indexed": success,
+        "errors": had_errors,
+        "ids": ids,
+    }
+
+
+def get_log(event_id: str) -> dict[str, Any] | None:
+    """
+    Fetch one log by event_id (document _id).
+
+    Returns None if missing — useful to verify Day 2 ingest before Day 3 search.
+    """
+    client = get_client()
+    try:
+        result = client.get(index=LOGS_INDEX, id=event_id)
+    except Exception as exc:
+        # NotFoundError and transport errors — treat missing as None
+        if getattr(exc, "status_code", None) == 404:
+            return None
+        # opensearch-py NotFoundError
+        if exc.__class__.__name__ == "NotFoundError":
+            return None
+        raise
+
+    source = result.get("_source")
+    if not isinstance(source, dict):
+        return None
+    return source
 
 
 def close_client() -> None:

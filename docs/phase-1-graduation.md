@@ -23,7 +23,7 @@
 ## Documentation
 
 - [x] README reflects Days 1–11 accurately
-- [x] docs/architecture.md
+- [x] docs/phase-1-architecture.md
 - [x] docs/request-flows.md
 - [x] docs/database-schema.md
 - [x] docs/bottlenecks-and-roadmap.md (with capstone experiment results)

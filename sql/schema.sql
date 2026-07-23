@@ -23,3 +23,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_metrics_dedup
 -- Day 10: GET /metrics/aggregate uses query-time GROUP BY on this table.
 -- idx_metrics_machine_metric_time supports the WHERE clause.
 -- At very large scale, consider a separate rollups table or ClickHouse (Phase 3).
+-- Phase 6 Day 1: tenant registry (also ensured by backend.tenancy on API boot)
+CREATE TABLE IF NOT EXISTS tenants (
+    tenant_id   VARCHAR(64) PRIMARY KEY,
+    name        VARCHAR(255) NOT NULL,
+    api_key     VARCHAR(128) NOT NULL UNIQUE,
+    active      BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    notes       TEXT
+);

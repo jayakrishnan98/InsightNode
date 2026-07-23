@@ -167,4 +167,10 @@ See [phase-5-graduation.md](phase-5-graduation.md).
 
 ### Phase 6 — Production SaaS concerns
 
-- Sharding, multi-tenancy, rate limiting, usage metering
+- **Day 1:** Tenant registry + `X-API-Key` identity (stamp `tenant_id` on ingest)
+- **Day 2:** Persist / query by `tenant_id` (storage isolation)
+- **Day 3:** Per-tenant rate limits (upgrade from `machine_id`)
+- **Day 4:** Usage metering + simple quotas
+- **Day 5:** Sharding concepts + docs + graduation
+
+See [phase-6-architecture.md](phase-6-architecture.md).

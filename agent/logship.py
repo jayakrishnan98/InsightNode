@@ -19,6 +19,7 @@ import httpx
 import tracing as agent_tracing
 
 LOGS_URL = os.getenv("INSIGHTNODE_LOGS_URL", "http://127.0.0.1:8001/logs")
+API_KEY = os.getenv("INSIGHTNODE_API_KEY", "dev-local-key")
 MACHINE_ID = socket.gethostname()
 SERVICE = "agent"
 
@@ -64,7 +65,11 @@ def ship(
     try:
         with agent_tracing.logship_span(level, message) as span:
             try:
-                response = httpx.post(LOGS_URL, json=payload, timeout=5.0)
+                headers = {"X-API-Key": API_KEY}
+                headers.update(agent_tracing.inject_headers())
+                response = httpx.post(
+                    LOGS_URL, json=payload, headers=headers, timeout=5.0
+                )
                 response.raise_for_status()
                 span.set_attribute("http.status_code", response.status_code)
             except Exception as exc:

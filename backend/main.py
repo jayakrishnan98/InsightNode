@@ -1,9 +1,9 @@
 """
-InsightNode API — metrics, logs, and OpenTelemetry traces (Phase 5 complete).
+InsightNode API — metrics, logs, traces, and multi-tenant identity (Phase 6 Day 1).
 
-Architecture (Phase 5):
-    Agent → FastAPI (HTTP spans) → Kafka (W3C headers) → worker (dual-write spans).
-    Spans export via OTLP → Jaeger; ops logs may carry attrs.trace_id.
+Architecture (Phase 6 Day 1):
+    Agents authenticate with X-API-Key → tenant_id stamped on ingest payloads.
+    Storage isolation / per-tenant limits / metering land on later Phase 6 days.
 """
 
 from datetime import datetime
@@ -55,6 +55,14 @@ from backend.rate_limit import (
     ingest_rate_limiter,
 )
 from backend import logship as backend_logship
+from backend.tenancy import (
+    DEFAULT_TENANT_ID,
+    TENANCY_STRICT,
+    TenantContext,
+    ensure_tenants_schema_and_seed,
+    list_tenants,
+    require_tenant,
+)
 from backend.tracing import (
     instrument_fastapi,
     ping as jaeger_ping,
@@ -72,12 +80,12 @@ EMBEDDED_WORKER = os.getenv("EMBEDDED_WORKER", "0") == "1"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    API lifespan: Kafka + ClickHouse + OpenSearch + tracing bootstrap.
+    API lifespan: Kafka + ClickHouse + OpenSearch + tenants + tracing bootstrap.
 
     Logic:
-        - ensure_topics / ClickHouse schema / OpenSearch index.
+        - ensure_topics / ClickHouse schema / OpenSearch index / tenants seed.
         - setup_tracing() in lifespan (idempotent if already done at import).
-        - FastAPI instrumentation is applied at import time (Day 2).
+        - FastAPI instrumentation is applied at import time (Phase 5).
         - Optional embedded Kafka worker.
     """
     global kafka_producer
@@ -91,6 +99,9 @@ async def lifespan(app: FastAPI):
 
     ensure_opensearch_index()
     logger.info("OpenSearch logs index ready")
+
+    ensure_tenants_schema_and_seed()
+    logger.info("Tenants registry ready (default=%s strict=%s)", DEFAULT_TENANT_ID, TENANCY_STRICT)
 
     if setup_tracing():
         logger.info("OpenTelemetry tracing ready")
@@ -136,7 +147,7 @@ async def lifespan(app: FastAPI):
     shutdown_tracing()
 
 
-app = FastAPI(title="InsightNode", version="0.9.0", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.10.0", lifespan=lifespan)
 
 # Phase 5 Day 2: instrument BEFORE the ASGI server starts (cannot add middleware later).
 if setup_tracing():
@@ -287,6 +298,8 @@ def health_check():
         "clickhouse_ok": clickhouse_ping(),
         "opensearch_ok": opensearch_ping(),
         "jaeger_ok": jaeger_ping(),
+        "tenancy_strict": TENANCY_STRICT,
+        "default_tenant_id": DEFAULT_TENANT_ID,
         "queue_backend": "kafka",
         "queue_size": approximate_lag(),
         "queue_maxsize": QUEUE_MAX_LENGTH,
@@ -296,6 +309,18 @@ def health_check():
         "rate_limit_window_seconds": RATE_LIMIT_WINDOW_SECONDS,
         "worker_mode": "embedded" if EMBEDDED_WORKER else "external",
     }
+
+
+@app.get("/tenants")
+def get_tenants():
+    """
+    List active tenants (Phase 6 Day 1) — API keys are masked.
+
+    Reason:
+        Makes the registry visible for local labs without exposing secrets.
+    """
+    tenants = list_tenants()
+    return {"count": len(tenants), "tenants": tenants}
 
 
 @app.get("/pipeline")
@@ -342,22 +367,30 @@ def list_dlq(limit: int = Query(20, ge=1, le=100)):
 
 
 @app.post("/logs", response_model=LogsIngestResponse, status_code=202)
-def ingest_logs(payload: LogsPayload):
+def ingest_logs(
+    payload: LogsPayload,
+    tenant: TenantContext = Depends(require_tenant),
+):
     """
     Accept structured logs and index them into OpenSearch (Phase 4 Day 2).
 
     Logic:
-        - Validate batch via Pydantic.
+        - Resolve tenant from X-API-Key (Phase 6 Day 1).
+        - Stamp tenant_id into each log's attrs (storage field comes Day 2).
         - Bulk-index into insightnode-logs using event_id as document _id.
         - Return 202 with indexed count + ids.
-        - refresh=True so immediate GET /logs/{event_id} works in labs.
 
     Reason:
         Logs are text events, not gauges — OpenSearch is the right store.
-        Direct index (no Kafka yet) keeps Day 2 focused on the document model.
-        Day 4 can add agent shipping; a Kafka log topic can come later if needed.
+        Tenant identity on Day 1 prepares isolation without a mapping migration yet.
     """
-    docs = [log.model_dump(mode="json") for log in payload.logs]
+    docs = []
+    for log in payload.logs:
+        doc = log.model_dump(mode="json")
+        attrs = dict(doc.get("attrs") or {})
+        attrs["tenant_id"] = tenant.tenant_id
+        doc["attrs"] = attrs
+        docs.append(doc)
     try:
         result = opensearch_index_logs(docs, refresh=True)
     except Exception:
@@ -498,13 +531,17 @@ def query_metrics(
 
 
 @app.post("/metrics", status_code=202)
-def ingest_metrics(payload: MetricsPayload):
+def ingest_metrics(
+    payload: MetricsPayload,
+    tenant: TenantContext = Depends(require_tenant),
+):
     """
     Accept metrics from agents — produce to Kafka for async persistence.
 
     Logic:
-        - Validate body via Pydantic.
-        - Per-machine_id rate limit (Day 6) → 429 if exceeded.
+        - Resolve tenant from X-API-Key (Phase 6 Day 1).
+        - Per-machine_id rate limit → 429 if exceeded (per-tenant limits = Day 3).
+        - Stamp tenant_id onto the Kafka payload (storage columns = Day 2).
         - Produce JSON to insightnode.ingest (key=machine_id).
         - If lag too high → 503 backpressure.
         - Return 202 Accepted with approximate lag.
@@ -523,6 +560,7 @@ def ingest_metrics(payload: MetricsPayload):
             "api",
             "Ingest rate limit exceeded",
             machine_id=payload.machine_id,
+            tenant_id=tenant.tenant_id,
             rate_limit_max=RATE_LIMIT_MAX,
             window_seconds=RATE_LIMIT_WINDOW_SECONDS,
         )
@@ -535,6 +573,7 @@ def ingest_metrics(payload: MetricsPayload):
         )
 
     item = payload.model_dump(mode="json")
+    item["tenant_id"] = tenant.tenant_id
 
     try:
         enqueue_payload(kafka_producer, item)
@@ -544,6 +583,7 @@ def ingest_metrics(payload: MetricsPayload):
             "api",
             "Kafka ingest lag too high — rejecting payload",
             machine_id=payload.machine_id,
+            tenant_id=tenant.tenant_id,
             event_id=payload.event_id,
             queue_maxsize=QUEUE_MAX_LENGTH,
         )
@@ -554,7 +594,8 @@ def ingest_metrics(payload: MetricsPayload):
 
     depth = approximate_lag()
     logger.info(
-        "Enqueued metrics machine=%s metric_count=%s lag=%s",
+        "Enqueued metrics tenant=%s machine=%s metric_count=%s lag=%s",
+        tenant.tenant_id,
         payload.machine_id,
         len(payload.metrics),
         depth,
@@ -562,6 +603,7 @@ def ingest_metrics(payload: MetricsPayload):
 
     return {
         "status": "accepted",
+        "tenant_id": tenant.tenant_id,
         "machine_id": payload.machine_id,
         "metric_count": len(payload.metrics),
         "queued": depth,

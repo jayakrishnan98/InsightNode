@@ -1,4 +1,4 @@
-# InsightNode Architecture (Phase 1)
+# Phase 1 Architecture — Agent → API → PostgreSQL
 
 Phase 1 implements a **push-based metrics pipeline**: a local agent samples host gauges, sends them to a FastAPI API, buffers them in an in-memory queue, and persists them to PostgreSQL via a background worker.
 

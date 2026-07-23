@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 5 complete — OpenTelemetry + Jaeger**  
-**Next: Phase 6 — production SaaS concerns (sharding, multi-tenancy, metering)**
+**Current stage: Phase 6 Day 1 — tenant identity (`X-API-Key`)**  
+**Next: Phase 6 Day 2 — persist / query by `tenant_id`**
 
-Phase 5 delivers distributed tracing across agent → API → Kafka → worker, with manual dual-write / logship spans and `attrs.trace_id` on shipped logs.
+Phase 6 Day 1 adds a `tenants` registry and resolves callers via `X-API-Key`, stamping `tenant_id` onto ingest payloads (storage isolation comes next).
 
 ---
 
@@ -46,6 +46,7 @@ FastAPI (rate limit, HTTP spans) ──produce──► Kafka ──workers─�
 | **ClickHouse** | Columnar analytics store (Phase 3 complete) |
 | **OpenSearch** | Centralized logs — ingest, search, shipping (Phase 4 complete) |
 | **Jaeger / OTEL** | Linked ingest traces; dual-write + logship spans; log `attrs.trace_id` |
+| **Tenancy (Day 1)** | `tenants` table + `X-API-Key` → `tenant_id` on ingest |
 
 ---
 
@@ -66,6 +67,7 @@ InsightNode/
 │   ├── clickhouse_client.py # Phase 3 — connect, insert, aggregate
 │   ├── opensearch_client.py # Phase 4 — index, get, search
 │   ├── tracing.py           # Phase 5 — OTEL, FastAPI, Kafka, manual spans
+│   ├── tenancy.py           # Phase 6 Day 1 — tenants + X-API-Key resolve
 │   ├── logship.py           # Phase 4/5 — API/worker → OpenSearch (+ spans)
 │   ├── postgres_aggregate.py# Phase 3 Day 4 — PG aggregate for compare
 │   ├── rate_limit.py        # Phase 2 Day 6 ingest rate limit
@@ -73,7 +75,7 @@ InsightNode/
 │   ├── database.py
 │   └── models.py
 ├── docs/
-│   ├── architecture.md
+│   ├── phase-1-architecture.md
 │   ├── phase-1-graduation.md
 │   ├── phase-2-architecture.md
 │   ├── phase-2-graduation.md
@@ -83,6 +85,7 @@ InsightNode/
 │   ├── phase-4-graduation.md
 │   ├── phase-5-architecture.md
 │   ├── phase-5-graduation.md
+│   ├── phase-6-architecture.md
 │   └── bottlenecks-and-roadmap.md
 ├── docker-compose.yml       # Redpanda + ClickHouse + OpenSearch + Jaeger
 ├── opensearch/
@@ -216,10 +219,12 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
+> See [docs/phase-6-architecture.md](docs/phase-6-architecture.md) for multi-tenancy (Day 1+).
 > See [docs/phase-5-architecture.md](docs/phase-5-architecture.md) and [docs/phase-5-graduation.md](docs/phase-5-graduation.md).
 > See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) and [docs/phase-4-graduation.md](docs/phase-4-graduation.md).
 > See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) and [docs/phase-3-graduation.md](docs/phase-3-graduation.md).
 > See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).
+> See [docs/phase-1-architecture.md](docs/phase-1-architecture.md) and [docs/phase-1-graduation.md](docs/phase-1-graduation.md).
 > Redis Streams code (`backend/redis_client.py`) remains as Days 1–4 learning history.
 
 ---
@@ -388,7 +393,7 @@ See [docs/database-schema.md](docs/database-schema.md) for full details.
 
 ## Architecture
 
-See [docs/architecture.md](docs/architecture.md) for system diagrams and design decisions.
+See [docs/phase-1-architecture.md](docs/phase-1-architecture.md) for system diagrams and design decisions.
 
 ### Ingestion flow
 
@@ -446,12 +451,13 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 | 3 | ClickHouse dual-write + analytics + PG vs CH compare |
 | 4 | OpenSearch logs — ingest, search, agent/API/worker shipping |
 | 5 | OpenTelemetry / Jaeger — distributed tracing + dual-write spans |
+| 6 | Multi-tenancy — Day 1 tenant registry + API-key identity (in progress) |
 
 ### Later phases
 
 | Phase | Focus |
 |-------|-------|
-| 6 | Sharding, multi-tenancy, rate limiting, usage metering |
+| 6 (rest) | Tenant isolation, per-tenant limits, metering, sharding |
 
 ---
 
@@ -468,7 +474,8 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 - [x] Implement idempotency keys for at-least-once delivery (Day 11)
 - [x] Document architecture, flows, schema, and bottlenecks (Day 12)
 
-**Phase 1 graduation:** [docs/phase-1-graduation.md](docs/phase-1-graduation.md)
+**Phase 1 graduation:** [docs/phase-1-graduation.md](docs/phase-1-graduation.md)  
+**Architecture:** [docs/phase-1-architecture.md](docs/phase-1-architecture.md)
 
 ---
 

@@ -24,6 +24,8 @@ import tracing as agent_tracing
 MACHINE_ID = socket.gethostname()
 COLLECTION_INTERVAL_SECONDS = int(os.getenv("COLLECTION_INTERVAL_SECONDS", "5"))
 API_URL = os.getenv("INSIGHTNODE_METRICS_URL", "http://127.0.0.1:8001/metrics")
+# Phase 6 Day 1 — must match a tenants.api_key (default seeded as dev-local-key).
+API_KEY = os.getenv("INSIGHTNODE_API_KEY", "dev-local-key")
 MAX_RETRIES = 5
 RETRY_BASE_DELAY_SECONDS = 1.0
 
@@ -150,6 +152,7 @@ def send_metrics_with_retry(payload: dict) -> bool:
             ) as span:
                 try:
                     headers = agent_tracing.inject_headers()
+                    headers["X-API-Key"] = API_KEY
                     response = httpx.post(
                         API_URL,
                         json=payload,

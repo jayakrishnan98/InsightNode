@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 5 Day 3 — trace context over Kafka**  
-**Next: Phase 5 Day 4 — manual spans for dual-write / logship**
+**Current stage: Phase 5 Day 4 — manual dual-write / logship spans**  
+**Next: Phase 5 Day 5 — docs + graduation**
 
-Phase 5 Day 3 propagates W3C `traceparent` agent → API (HTTP) and API → worker (Kafka headers) so one `trace_id` spans the ingest path.
+Phase 5 Day 4 adds manual spans for PostgreSQL + ClickHouse dual-write and logship, plus `trace_id`/`span_id` on shipped logs for Jaeger ↔ OpenSearch correlation.
 
 ---
 
@@ -43,7 +43,7 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
 | **Agent resilience** | Retries + on-disk spool |
 | **ClickHouse** | Columnar analytics store (Phase 3 complete) |
 | **OpenSearch** | Centralized logs — ingest, search, agent/API/worker shipping (Phase 4 complete) |
-| **Jaeger (Day 3)** | OTLP + UI; agent→API→worker linked by W3C context |
+| **Jaeger (Day 4)** | Linked ingest traces; dual-write + logship spans; log `attrs.trace_id` |
 
 ---
 
@@ -213,7 +213,7 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
-> See [docs/phase-5-architecture.md](docs/phase-5-architecture.md) for OpenTelemetry (Days 1–3).
+> See [docs/phase-5-architecture.md](docs/phase-5-architecture.md) for OpenTelemetry (Days 1–4).
 > See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) and [docs/phase-4-graduation.md](docs/phase-4-graduation.md).
 > See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) and [docs/phase-3-graduation.md](docs/phase-3-graduation.md).
 > See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).
@@ -442,7 +442,7 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 | 2 | Kafka ingest bus, workers, DLQ, rate limits, `/pipeline` |
 | 3 | ClickHouse dual-write + analytics + PG vs CH compare |
 | 4 | OpenSearch logs — ingest, search, agent/API/worker shipping |
-| 5 | OpenTelemetry / Jaeger — Day 3 context propagation (Kafka + agent) |
+| 5 | OpenTelemetry / Jaeger — Day 4 manual spans + trace↔log attrs |
 
 ### Later phases
 

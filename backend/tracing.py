@@ -4,6 +4,7 @@ OpenTelemetry tracing for Phase 5.
 Day 1: TracerProvider + OTLP HTTP exporter → Jaeger; health ping.
 Day 2: FastAPI HTTP auto-instrumentation (one span per request).
 Day 3: W3C context propagation — HTTP (agent→API) + Kafka headers (API→worker).
+Day 4: Manual spans for dual-write / logship + event_id / trace↔log attrs.
 """
 
 from __future__ import annotations
@@ -88,7 +89,7 @@ def setup_tracing(service_name: str | None = None) -> bool:
     tracer = trace.get_tracer("insightnode.tracing")
     with tracer.start_as_current_span("startup.bootstrap") as span:
         span.set_attribute("insightnode.phase", "5")
-        span.set_attribute("insightnode.day", "3")
+        span.set_attribute("insightnode.day", "4")
 
     logger.info(
         "OpenTelemetry tracing ready service=%s otlp=%s",
@@ -245,6 +246,61 @@ def record_span_error(span: trace.Span, exc: BaseException) -> None:
     """Mark a span failed (worker / produce errors)."""
     span.record_exception(exc)
     span.set_status(Status(StatusCode.ERROR, str(exc)))
+
+
+def current_trace_context() -> dict[str, str]:
+    """
+    Hex trace_id / span_id for the active span (Phase 5 Day 4).
+
+    Logic:
+        - Read the current span context; return {} if invalid / unset.
+        - Callers merge into logship `attrs` so OpenSearch can filter by trace.
+
+    Reason:
+        Traces answer "where"; logs answer "what". Shared IDs let you jump
+        from a Jaeger waterfall to matching log lines (and vice versa).
+    """
+    span = trace.get_current_span()
+    ctx = span.get_span_context()
+    if not ctx or not ctx.is_valid:
+        return {}
+    return {
+        "trace_id": format(ctx.trace_id, "032x"),
+        "span_id": format(ctx.span_id, "016x"),
+    }
+
+
+@contextmanager
+def manual_span(
+    name: str,
+    *,
+    attributes: dict[str, Any] | None = None,
+    kind: SpanKind = SpanKind.INTERNAL,
+) -> Iterator[trace.Span]:
+    """
+    Explicit child span under the current context (Phase 5 Day 4).
+
+    Logic:
+        - start_as_current_span so nested `with` blocks form a waterfall.
+        - Optional attributes (event_id, row counts, service, …).
+        - On exception: record + ERROR status, then re-raise.
+
+    Reason:
+        Auto-instrumentation covers HTTP edges; dual-write and logship need
+        manual spans to show *where time goes inside* the worker.
+    """
+    tracer = get_tracer("insightnode")
+    with tracer.start_as_current_span(name, kind=kind) as span:
+        if attributes:
+            for key, value in attributes.items():
+                if value is None:
+                    continue
+                span.set_attribute(key, value)
+        try:
+            yield span
+        except Exception as exc:
+            record_span_error(span, exc)
+            raise
 
 
 def ping() -> bool:

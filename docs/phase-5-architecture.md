@@ -6,47 +6,66 @@ Phase 5 adds **distributed tracing**: follow one request/work unit across API �
 Phase 4:  logs → OpenSearch
 Day 1:    + Jaeger up (OTLP + UI) + TracerProvider bootstrap
 Day 2:    Instrument FastAPI HTTP requests (auto spans)
-Day 3:    Propagate context across Kafka (agent → API → worker)  ← YOU ARE HERE
-Day 4:    Manual spans for dual-write / logship + event_id attrs
+Day 3:    Propagate context across Kafka (agent → API → worker)
+Day 4:    Manual spans for dual-write / logship + event_id attrs  ← YOU ARE HERE
 Day 5:    Docs + graduation
 ```
 
 ---
 
-## Current architecture (Day 3)
+## Current architecture (Day 4)
 
 ```mermaid
-flowchart LR
-  Agent -->|traceparent HTTP| API[FastAPI]
-  API -->|traceparent Kafka headers| Worker
-  Agent -->|OTLP| Jaeger[(Jaeger)]
-  API -->|OTLP| Jaeger
-  Worker -->|OTLP| Jaeger
-  Jaeger -->|UI :16686| Browser
+flowchart TB
+  subgraph ingest [One ingest trace]
+    A[agent.push_metrics] --> B[POST /metrics]
+    B --> C[kafka.produce]
+    C --> D[kafka.consume]
+    D --> E[dual_write]
+    E --> F[db.postgres.insert]
+    E --> G[db.clickhouse.insert]
+  end
+  D -.->|on failure| H[logship.index]
+  A -.->|ops logs| I[logship.ship]
+  ingest -->|OTLP| Jaeger[(Jaeger)]
+  H -->|attrs.trace_id| OS[(OpenSearch)]
 ```
 
-| Hop | Mechanism | Span |
-|-----|-----------|------|
-| Agent → API | W3C `traceparent` HTTP header | `agent.push_metrics` (CLIENT) → `POST /metrics` (SERVER) |
-| API → Worker | Same headers on Kafka record | `kafka.produce` (PRODUCER) → `kafka.consume` (CONSUMER) |
+| Span | Kind | Where |
+|------|------|--------|
+| `agent.push_metrics` | CLIENT | Agent HTTP POST |
+| `POST /metrics` | SERVER | FastAPI auto |
+| `kafka.produce` / `kafka.consume` | PRODUCER / CONSUMER | Day 3 |
+| `dual_write` | INTERNAL | Worker parent for both stores |
+| `db.postgres.insert` | INTERNAL | PG dual-write step |
+| `db.clickhouse.insert` | INTERNAL | CH dual-write step |
+| `logship.index` / `logship.ship` | INTERNAL | Ops log shipping |
 
-Same `trace_id` across all three services. Jaeger UI → any service → Find Traces shows the full chain.
+Common attributes: `insightnode.event_id`, `insightnode.row_count`, `db.system`.
 
 ---
 
-## Day 3 lesson — context propagation
+## Day 4 lesson — manual spans + correlation
 
 ```
-inject(carrier)   # write traceparent from current span
-extract(carrier)  # rebuild parent context in another process
+with manual_span("dual_write"):
+    with manual_span("db.postgres.insert"): ...
+    with manual_span("db.clickhouse.insert"): ...
 ```
 
-| Carrier | Where |
-|---------|--------|
-| HTTP headers | Agent `httpx.post(..., headers=inject())` |
-| Kafka headers | `producer.send(..., headers=[(k, bytes)])` |
+| Approach | Covers |
+|----------|--------|
+| Auto (Day 2) | HTTP edge |
+| Propagation (Day 3) | Same `trace_id` across processes |
+| Manual (Day 4) | Steps *inside* a process (PG vs CH vs logship) |
 
-Without inject/extract, each process starts a **new** root span — you cannot stitch agent → API → worker into one waterfall.
+**Trace ↔ log:** `logship` merges `attrs.trace_id` / `attrs.span_id` from the active span. Search OpenSearch for a Jaeger `trace_id` to find related ops messages.
+
+```bash
+# Example: after copying a trace id from Jaeger
+curl -s "http://127.0.0.1:8001/logs/search?q=*&limit=5"
+# Filter in UI / query attrs.trace_id when shipping fires (rate-limit, DLQ, …)
+```
 
 ---
 
@@ -58,8 +77,6 @@ Without inject/extract, each process starts a **new** root span — you cannot s
 | `insightnode-api` | `uvicorn backend.main:app` |
 | `insightnode-worker` | `python -m backend.worker` |
 
-Embedded worker (`EMBEDDED_WORKER=1`) shares the API process → spans appear under `insightnode-api`.
-
 ---
 
 ## Local ops
@@ -68,16 +85,23 @@ Embedded worker (`EMBEDDED_WORKER=1`) shares the API process → spans appear un
 docker compose up -d
 uvicorn backend.main:app --reload --port 8001
 python -m backend.worker
-# optional: python agent/main.py
 
-# Or curl with a synthetic parent (still exercises API → Kafka → worker):
-curl -X POST "http://127.0.0.1:8001/metrics" \
-  -H "Content-Type: application/json" \
-  -d '{"machine_id":"demo","timestamp":"2026-07-22T12:00:00Z","metrics":[{"name":"cpu_usage","value":1,"unit":"%"}],"event_id":"day3-demo"}'
+# Trigger a full waterfall (use a real UUID for event_id):
+python - <<'PY'
+import uuid, httpx
+eid = str(uuid.uuid4())
+r = httpx.post("http://127.0.0.1:8001/metrics", json={
+    "machine_id": "day4-demo",
+    "timestamp": "2026-07-23T12:00:00Z",
+    "event_id": eid,
+    "metrics": [{"name": "cpu_usage", "value": 3.0, "unit": "%"}],
+})
+print(r.status_code, eid, r.json())
+PY
 
 open http://localhost:16686
-# Service: insightnode-api or insightnode-worker → Find Traces
-# Expect: POST /metrics → kafka.produce → kafka.consume (same trace)
+# Expect under insightnode-worker:
+#   kafka.consume → dual_write → db.postgres.insert + db.clickhouse.insert
 ```
 
 ---
@@ -87,13 +111,13 @@ open http://localhost:16686
 | Pillar | Store | Question |
 |--------|-------|----------|
 | Metrics | PG + ClickHouse | How much? |
-| Logs | OpenSearch | What message? |
+| Logs | OpenSearch (`attrs.trace_id`) | What message? |
 | Traces | Jaeger | Where did time go? |
 
 ---
 
-## What Day 3 deliberately does not include
+## What Day 4 deliberately does not include
 
-- Manual spans around dual-write / logship internals → **Day 4**
-- Sampling strategies / tail-based sampling → later
-- Trace↔log correlation fields in OpenSearch → Day 4/5
+- Graduation write-up / sampling strategies → **Day 5**
+- Auto-instrumentation of SQLAlchemy / ClickHouse drivers → optional later
+- Changing dual-write semantics (still PG → CH → Kafka commit)

@@ -5,6 +5,7 @@ Phase 2: Kafka consumer group, ACK-after-commit, DLQ for poison messages.
 Phase 3 Day 2: each successful batch also inserts into ClickHouse.
 Phase 4 Day 4: ships structured ops logs for DLQ / delivery failures.
 Phase 5 Day 3: extract W3C trace context from Kafka headers → continue traces.
+Phase 5 Day 4: manual dual-write spans (PG + ClickHouse) under kafka.consume.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ from backend.models import MetricRecord
 from backend import logship as backend_logship
 from backend.tracing import (
     kafka_consume_span,
+    manual_span,
     record_span_error,
     setup_tracing,
     shutdown_tracing,
@@ -82,6 +84,8 @@ def _flush_batch(db: Session, batch: list[dict]) -> None:
 
     Logic:
         - Expand payloads → row dicts.
+        - Under a dual_write parent span: PG insert, then ClickHouse insert
+          (Phase 5 Day 4 — shows where worker time goes).
         - Idempotent INSERT into PostgreSQL (ON CONFLICT DO NOTHING).
         - Append the same rows into ClickHouse.
         - Caller commits Kafka offsets only if this returns without error.
@@ -99,15 +103,37 @@ def _flush_batch(db: Session, batch: list[dict]) -> None:
     if not rows:
         return
 
-    stmt = insert(MetricRecord).values(rows)
-    stmt = stmt.on_conflict_do_nothing(
-        index_elements=["machine_id", "event_id", "metric_name"],
-        index_where=text("event_id IS NOT NULL"),
+    event_ids = sorted(
+        {str(r["event_id"]) for r in rows if r.get("event_id") is not None}
     )
-    result = db.execute(stmt)
-    db.commit()
+    attrs = {
+        "insightnode.row_count": len(rows),
+        "insightnode.payload_count": len(batch),
+    }
+    if len(event_ids) == 1:
+        attrs["insightnode.event_id"] = event_ids[0]
+    elif event_ids:
+        attrs["insightnode.event_id_count"] = len(event_ids)
 
-    insert_clickhouse_metrics(rows)
+    with manual_span("dual_write", attributes=attrs):
+        with manual_span(
+            "db.postgres.insert",
+            attributes={"db.system": "postgresql", "insightnode.row_count": len(rows)},
+        ) as pg_span:
+            stmt = insert(MetricRecord).values(rows)
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=["machine_id", "event_id", "metric_name"],
+                index_where=text("event_id IS NOT NULL"),
+            )
+            result = db.execute(stmt)
+            db.commit()
+            pg_span.set_attribute("insightnode.pg_new_rows", int(result.rowcount or 0))
+
+        with manual_span(
+            "db.clickhouse.insert",
+            attributes={"db.system": "clickhouse", "insightnode.row_count": len(rows)},
+        ):
+            insert_clickhouse_metrics(rows)
 
     logger.info(
         "Persisted batch: %s row(s) submitted, %s new in PG (+ ClickHouse)",

@@ -249,8 +249,8 @@ def main() -> None:
         automatic when the API comes back. Structured logs make agent health
         searchable in OpenSearch alongside metrics charts.
     """
-    logship.info("Agent starting", metrics_url=API_URL)
     agent_tracing.setup_tracing()
+    logship.info("Agent starting", metrics_url=API_URL)
     try:
         while True:
             replay_spool()

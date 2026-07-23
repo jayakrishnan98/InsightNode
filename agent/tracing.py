@@ -99,3 +99,28 @@ def push_metrics_span(event_id: str | None = None) -> Iterator[trace.Span]:
 def record_error(span: trace.Span, exc: BaseException) -> None:
     span.record_exception(exc)
     span.set_status(Status(StatusCode.ERROR, str(exc)))
+
+
+def current_trace_context() -> dict[str, str]:
+    """Hex trace_id / span_id for log correlation (Phase 5 Day 4)."""
+    span = trace.get_current_span()
+    ctx = span.get_span_context()
+    if not ctx or not ctx.is_valid:
+        return {}
+    return {
+        "trace_id": format(ctx.trace_id, "032x"),
+        "span_id": format(ctx.span_id, "016x"),
+    }
+
+
+@contextmanager
+def logship_span(level: str, message: str) -> Iterator[trace.Span]:
+    """CLIENT-ish internal span around agent → POST /logs."""
+    tracer = trace.get_tracer("insightnode.agent")
+    with tracer.start_as_current_span("logship.ship") as span:
+        span.set_attribute("insightnode.log_level", level)
+        span.set_attribute("insightnode.phase", "5")
+        span.set_attribute("insightnode.day", "4")
+        # Keep message short — attributes should stay compact.
+        span.set_attribute("insightnode.log_message", message[:200])
+        yield span

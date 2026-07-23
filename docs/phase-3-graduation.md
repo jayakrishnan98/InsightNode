@@ -1,7 +1,7 @@
 # Phase 3 Graduation Checklist
 
 **Completed:** Phase 3 Day 5  
-**Next:** Phase 4 — OpenSearch (centralized log search)
+**Next:** Phase 4 Day 1 — OpenSearch (logs index + health)
 
 ---
 

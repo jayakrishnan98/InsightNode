@@ -7,3 +7,4 @@ psycopg2-binary==2.9.10
 redis==5.2.1
 kafka-python-ng==2.2.3
 clickhouse-connect==0.8.17
+opensearch-py==2.7.1

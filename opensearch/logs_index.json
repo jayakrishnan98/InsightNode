@@ -1,0 +1,18 @@
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "refresh_interval": "1s"
+  },
+  "mappings": {
+    "properties": {
+      "timestamp": { "type": "date" },
+      "machine_id": { "type": "keyword" },
+      "service": { "type": "keyword" },
+      "level": { "type": "keyword" },
+      "message": { "type": "text" },
+      "event_id": { "type": "keyword" },
+      "attrs": { "type": "object", "enabled": true }
+    }
+  }
+}

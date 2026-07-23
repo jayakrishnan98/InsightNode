@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 3 complete (Day 5)**  
-**Next: Phase 4 — OpenSearch (centralized log search)**
+**Current stage: Phase 4 Day 1 — OpenSearch up**  
+**Next: Phase 4 Day 2 — log ingest into OpenSearch**
 
-Phase 3 dual-writes metrics to PostgreSQL + ClickHouse. Raw queries stay on PostgreSQL; aggregates and the optional compare lab endpoint use ClickHouse (and PG for timing).
+Phase 3 dual-writes metrics to PostgreSQL + ClickHouse. Phase 4 Day 1 adds OpenSearch (logs index + health); log ingest/search starts Day 2.
 
 ---
 
@@ -40,6 +40,7 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
 | **Ops** | `/health` (Kafka + ClickHouse), `/pipeline` (partition lag), `/dlq` |
 | **Agent resilience** | Retries + on-disk spool |
 | **ClickHouse** | Columnar analytics store (Phase 3 complete) |
+| **OpenSearch (Day 1)** | Logs index up; ingest/search starts Day 2 |
 
 ---
 
@@ -56,6 +57,7 @@ InsightNode/
 │   ├── worker.py            # Kafka consumer → PostgreSQL + ClickHouse
 │   ├── kafka_client.py      # Phase 2 Day 5–6 Kafka helpers
 │   ├── clickhouse_client.py # Phase 3 — connect, insert, aggregate
+│   ├── opensearch_client.py # Phase 4 Day 1 — connect + ensure logs index
 │   ├── postgres_aggregate.py# Phase 3 Day 4 — PG aggregate for compare
 │   ├── rate_limit.py        # Phase 2 Day 6 ingest rate limit
 │   ├── redis_client.py      # Phase 2 Days 1–4 (history)
@@ -68,8 +70,11 @@ InsightNode/
 │   ├── phase-2-graduation.md
 │   ├── phase-3-architecture.md
 │   ├── phase-3-graduation.md
+│   ├── phase-4-architecture.md
 │   └── ...
-├── docker-compose.yml       # Redpanda (:9092) + ClickHouse (:8123)
+├── docker-compose.yml       # Redpanda + ClickHouse + OpenSearch (:9200)
+├── opensearch/
+│   └── logs_index.json      # insightnode-logs mapping
 ├── sql/
 │   ├── schema.sql           # PostgreSQL
 │   └── clickhouse/
@@ -129,15 +134,16 @@ export DATABASE_URL="postgresql://user:password@localhost:5432/insightnode"
 
 Run from the **project root** (`InsightNode/`).
 
-### Start Kafka + ClickHouse (Phase 2 / Phase 3 Day 1)
+### Start Kafka + ClickHouse + OpenSearch
 
 ```bash
 docker compose up -d
 # Kafka API on localhost:9092
 # ClickHouse HTTP on localhost:8123  (user/pass: insightnode / insightnode)
+# OpenSearch HTTP on localhost:9200  (security disabled for local learning)
 ```
 
-Install Python deps (includes `kafka-python` + `clickhouse-connect`):
+Install Python deps (includes `kafka-python`, `clickhouse-connect`, `opensearch-py`):
 
 ```bash
 pip install -r requirements.txt
@@ -188,7 +194,7 @@ Check pipeline health:
 
 ```bash
 curl http://127.0.0.1:8001/health
-# queue_backend: kafka, kafka_ok: true, clickhouse_ok: true, queue_size (lag) near 0
+# queue_backend: kafka, kafka_ok / clickhouse_ok / opensearch_ok: true
 
 # Per-partition lag (Phase 2 Day 6)
 curl http://127.0.0.1:8001/pipeline
@@ -197,6 +203,7 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
+> See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) for OpenSearch Day 1.
 > See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) and [docs/phase-3-graduation.md](docs/phase-3-graduation.md).
 > See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).
 > Redis Streams code (`backend/redis_client.py`) remains as Days 1–4 learning history.
@@ -371,12 +378,13 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 | 1 | Agent → API → queue → PostgreSQL; aggregates; idempotency |
 | 2 | Kafka ingest bus, workers, DLQ, rate limits, `/pipeline` |
 | 3 | ClickHouse dual-write + analytics + PG vs CH compare |
+| 4 | OpenSearch — Day 1 index/health → Day 2+ log ingest/search |
 
 ### Later phases
 
 | Phase | Focus |
 |-------|-------|
-| 4 | OpenSearch — centralized log search |
+| 4 | OpenSearch — centralized log search (in progress) |
 | 5 | OpenTelemetry — distributed tracing |
 | 6 | Sharding, multi-tenancy, rate limiting, usage metering |
 

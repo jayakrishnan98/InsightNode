@@ -49,5 +49,36 @@ services:
       timeout: 3s
       retries: 10
 
+  # Phase 4 Day 1 — full-text log search (single-node, security disabled for local learning)
+  opensearch:
+    image: opensearchproject/opensearch:2.11.1
+    container_name: insightnode-opensearch
+    environment:
+      - discovery.type=single-node
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      - DISABLE_SECURITY_PLUGIN=true
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+      - cluster.name=insightnode
+      - node.name=insightnode-opensearch
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "9200:9200"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200 >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
 volumes:
   clickhouse_data:
+  opensearch_data:

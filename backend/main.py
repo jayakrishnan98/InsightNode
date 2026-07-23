@@ -1,15 +1,9 @@
 """
-InsightNode API — ingestion and query endpoints for host metrics.
+InsightNode API — ingestion and query endpoints for host metrics (and Phase 4 logs infra).
 
-Architecture (Phase 3 complete):
-    Agent --POST /metrics--> Kafka topic --standalone worker(s)--+--> PostgreSQL
-                              (202 + rate limit)  (consumer group) |
-                                                   │               +--> ClickHouse
-                                                   └─ poison → Kafka DLQ topic
-
-    GET /metrics                   → PostgreSQL (raw points)
-    GET /metrics/aggregate         → ClickHouse (analytics)
-    GET /metrics/aggregate/compare → time both stores (lab)
+Architecture (Phase 4 Day 1):
+    Metrics path unchanged (Kafka → PG + ClickHouse).
+    OpenSearch is up (logs index + health ping). Log ingest/search lands Day 2+.
 """
 
 from datetime import datetime
@@ -32,6 +26,11 @@ from backend.clickhouse_client import (
     ensure_schema as ensure_clickhouse_schema,
     ping as clickhouse_ping,
     query_aggregate as clickhouse_query_aggregate,
+)
+from backend.opensearch_client import (
+    close_client as close_opensearch,
+    ensure_index as ensure_opensearch_index,
+    ping as opensearch_ping,
 )
 from backend.postgres_aggregate import query_aggregate as postgres_query_aggregate
 from backend.kafka_client import (
@@ -63,17 +62,14 @@ EMBEDDED_WORKER = os.getenv("EMBEDDED_WORKER", "0") == "1"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    API lifespan: Kafka + ClickHouse bootstrap; optionally start embedded worker.
+    API lifespan: Kafka + ClickHouse + OpenSearch bootstrap; optional embedded worker.
 
     Logic:
         - ensure_topics() so produce never hits UNKNOWN_TOPIC on first boot.
         - ensure_clickhouse_schema() so insightnode.metrics exists.
+        - ensure_opensearch_index() so insightnode-logs exists.
         - Create a process-wide KafkaProducer.
         - If EMBEDDED_WORKER=1, spawn in-process worker thread.
-
-    Reason:
-        Producers should be long-lived (connection reuse). Topics and CH schema
-        must exist before agents start posting / Day 2 dual-write begins.
     """
     global kafka_producer
 
@@ -83,6 +79,9 @@ async def lifespan(app: FastAPI):
 
     ensure_clickhouse_schema()
     logger.info("ClickHouse schema ready")
+
+    ensure_opensearch_index()
+    logger.info("OpenSearch logs index ready")
 
     stop_event = None
     worker_thread = None
@@ -119,9 +118,10 @@ async def lifespan(app: FastAPI):
         kafka_producer = None
 
     close_clickhouse()
+    close_opensearch()
 
 
-app = FastAPI(title="InsightNode", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.6.0", lifespan=lifespan)
 
 class Metric(BaseModel):
     """Single metric reading inside an ingestion payload (name, value, unit)."""
@@ -217,6 +217,7 @@ def health_check():
         "status": "ok",
         "kafka_ok": kafka_ping(),
         "clickhouse_ok": clickhouse_ping(),
+        "opensearch_ok": opensearch_ping(),
         "queue_backend": "kafka",
         "queue_size": approximate_lag(),
         "queue_maxsize": QUEUE_MAX_LENGTH,

@@ -147,7 +147,11 @@ See [phase-3-graduation.md](phase-3-graduation.md).
 
 ### Phase 4 — Logs
 
-- **OpenSearch** for centralized log search
+- **Day 1:** OpenSearch up (Docker, `insightnode-logs` index, health ping)
+- **Day 2:** Log ingest API / pipeline into OpenSearch
+- **Day 3:** Full-text search + structured filters
+- **Day 4:** Agent / service log shipping
+- **Day 5:** Docs + graduation
 
 ### Phase 5 — Traces
 

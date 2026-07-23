@@ -1,9 +1,9 @@
 """
-InsightNode API — metrics + Phase 4 logs.
+InsightNode API — metrics + Phase 4 logs (Phase 4 complete).
 
-Architecture (Phase 4 Day 4):
+Architecture:
     Metrics: Kafka → workers → PostgreSQL + ClickHouse.
-    Logs:    POST /logs + GET /logs/search; agent/API ship structured ops logs.
+    Logs:    POST /logs + GET /logs/search; agent/API/worker structured shipping.
 """
 
 from datetime import datetime
@@ -125,7 +125,7 @@ async def lifespan(app: FastAPI):
     close_opensearch()
 
 
-app = FastAPI(title="InsightNode", version="0.6.3", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.7.0", lifespan=lifespan)
 
 class Metric(BaseModel):
     """Single metric reading inside an ingestion payload (name, value, unit)."""

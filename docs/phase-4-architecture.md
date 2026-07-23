@@ -7,13 +7,13 @@ Phase 3:  metrics → Kafka → PG + ClickHouse; aggregate on CH
 Day 1:    + OpenSearch up (index + health)
 Day 2:    POST /logs → OpenSearch
 Day 3:    GET /logs/search full-text + filters
-Day 4:    Agent / API structured log shipping          ← YOU ARE HERE
-Day 5:    Docs + graduation
+Day 4:    Agent / API structured log shipping
+Day 5:    Docs + graduation                          ← COMPLETE
 ```
 
 ---
 
-## Current architecture (Day 4)
+## Final architecture (Phase 4 complete)
 
 ```mermaid
 flowchart LR
@@ -28,72 +28,73 @@ flowchart LR
   Client -->|GET /logs/search| OS
 ```
 
-| Producer | How logs are shipped | `service` field |
-|----------|----------------------|-----------------|
-| Agent | HTTP `POST /logs` via `agent/logship.py` | `agent` |
-| API | In-process `backend/logship.py` → OpenSearch | `api` |
-| Worker | In-process `backend/logship.py` → OpenSearch | `worker` |
+| Signal | Store | Role |
+|--------|-------|------|
+| Metrics | Kafka → PG + ClickHouse | Gauges, aggregates |
+| Logs | OpenSearch | Full-text + filters |
 
-Log shipping is **best-effort**: failures never break metric ingest or spooling.
-
----
-
-## Day 4 lesson — ship events, not stdout
-
-| Before | After |
-|--------|-------|
-| `print("[RETRY] …")` only on console | Also a structured OpenSearch document |
-| Guess which host failed | Filter `service=agent` + `machine_id=…` |
-| Metrics show high disk | Logs explain "Disk usage high: 92%" with attrs |
-
-What the agent ships:
-
-- Startup `info`
-- Retry / send failure `warn` / `error`
-- Spool replay / pending `info` / `warn`
-- Threshold crossings (`cpu` / `memory` / `disk`) as `warn`
-
-What API / worker ship:
-
-- Rate limit exceeded (`api` / `warn`)
-- Kafka lag backpressure (`api` / `warn`)
-- Uncommitted retry / DLQ poison (`worker` / `warn` / `error`)
+Graduation checklist: [`phase-4-graduation.md`](phase-4-graduation.md)
 
 ---
 
-## Search examples
+## Day-by-day recap
 
-```bash
-# Agent threshold warnings
-curl "http://127.0.0.1:8001/logs/search?service=agent&level=warn&q=Disk"
-
-# API rate limits
-curl "http://127.0.0.1:8001/logs/search?service=api&q=rate"
-
-# Worker DLQ events
-curl "http://127.0.0.1:8001/logs/search?service=worker&level=error"
-```
-
-Lower agent thresholds for a demo:
-
-```bash
-DISK_WARN_PERCENT=1 CPU_WARN_PERCENT=1 MEMORY_WARN_PERCENT=1 python main.py
-```
+| Day | Deliverable |
+|-----|-------------|
+| 1 | Docker OpenSearch, `insightnode-logs` mapping, client ping, `opensearch_ok` |
+| 2 | `POST /logs` + `GET /logs/{event_id}` |
+| 3 | `GET /logs/search` (`must` + `filter` bool query) |
+| 4 | Agent / API / worker structured log shipping |
+| 5 | Architecture + graduation docs |
 
 ---
 
-## APIs (Days 2–3, still in force)
+## Index: `insightnode-logs`
+
+Source: [`opensearch/logs_index.json`](../opensearch/logs_index.json)
+
+| Field | Type | Role |
+|-------|------|------|
+| `timestamp` | `date` | Range + sort |
+| `machine_id` / `service` / `level` | `keyword` | Exact filters |
+| `message` | `text` | Full-text `q` |
+| `event_id` | `keyword` | Document `_id` + correlation |
+| `attrs` | `object` | Extra structured fields |
+
+---
+
+## Log producers
+
+| Producer | Path | `service` |
+|----------|------|-----------|
+| Agent | HTTP `POST /logs` (`agent/logship.py`) | `agent` |
+| API | In-process (`backend/logship.py`) | `api` |
+| Worker | In-process (`backend/logship.py`) | `worker` |
+
+Shipping is **best-effort** — never blocks metric ingest or spool.
+
+---
+
+## APIs
 
 | Endpoint | Role |
 |----------|------|
-| `POST /logs` | Bulk index (agent uses this) |
+| `POST /logs` | Bulk index |
 | `GET /logs/search` | Full-text + filters |
 | `GET /logs/{event_id}` | Direct get by id |
 
+```bash
+curl "http://127.0.0.1:8001/logs/search?service=agent&level=warn&q=Disk"
+curl "http://127.0.0.1:8001/logs/search?service=api&q=rate"
+curl "http://127.0.0.1:8001/logs/search?service=worker&level=error"
+```
+
 ---
 
-## What Day 4 deliberately does not include
+## What Phase 4 deliberately does not include
 
-- Shipping every Python `logger.info` line (too noisy)
-- Kafka topic for logs (direct / in-process is enough for learning)
-- Formal graduation → **Day 5**
+- Shipping every Python log line (noise)
+- Kafka topic dedicated to logs
+- OpenSearch Dashboards UI
+- Production TLS / security plugin
+- Distributed traces → **Phase 5 (OpenTelemetry)**

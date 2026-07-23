@@ -2,29 +2,28 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 4 Day 4 — structured log shipping**  
-**Next: Phase 4 Day 5 — docs + graduation**
+**Current stage: Phase 4 complete (Day 5)**  
+**Next: Phase 5 — OpenTelemetry + traces**
 
-Phase 4 Day 4: the agent ships lifecycle/threshold logs via `POST /logs`; API and workers ship ops events (rate limit, lag, DLQ) into OpenSearch. Search with `GET /logs/search`.
+Phase 4 adds OpenSearch for structured logs: ingest, search, and shipping from agent/API/workers. Metrics remain on Kafka → PostgreSQL + ClickHouse.
 
 ---
 
 ## What it does
 
-InsightNode collects host metrics (CPU, memory, disk) from a local agent, ingests them through a FastAPI backend, stores them in PostgreSQL, and exposes raw and aggregated query APIs.
+InsightNode collects host metrics and structured logs from a local agent, ingests them through a FastAPI backend, stores metrics in PostgreSQL + ClickHouse, indexes logs in OpenSearch, and exposes query/search APIs.
 
 ```
-Agent (psutil + spool)
+Agent (psutil + spool + logship)
     │  POST /metrics {event_id, ...}
+    │  POST /logs    {structured events}
     ▼
 FastAPI (rate limit) ──produce──► Kafka ──workers──► PostgreSQL
   │ 202 / 429 / 503                 │            └─► ClickHouse
-  ├── GET /metrics (PG)             └─ DLQ topic
+  ├── GET /metrics (PG)             └─ DLQ topic     (+ worker logship)
   ├── GET /metrics/aggregate (CH)
   ├── GET /metrics/aggregate/compare
-  ├── POST /logs             (OpenSearch)
-  ├── GET /logs/search
-  ├── GET /logs/{event_id}
+  ├── POST /logs / GET /logs/search / GET /logs/{id}  (OpenSearch)
   ├── GET /health          (+ clickhouse_ok, opensearch_ok)
   ├── GET /pipeline
   └── GET /dlq
@@ -43,7 +42,7 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
 | **Ops** | `/health` (Kafka + ClickHouse), `/pipeline` (partition lag), `/dlq` |
 | **Agent resilience** | Retries + on-disk spool |
 | **ClickHouse** | Columnar analytics store (Phase 3 complete) |
-| **OpenSearch (Day 4)** | Ingest + search + agent/API/worker log shipping |
+| **OpenSearch** | Centralized logs — ingest, search, agent/API/worker shipping (Phase 4 complete) |
 
 ---
 
@@ -76,6 +75,7 @@ InsightNode/
 │   ├── phase-3-architecture.md
 │   ├── phase-3-graduation.md
 │   ├── phase-4-architecture.md
+│   ├── phase-4-graduation.md
 │   └── ...
 ├── docker-compose.yml       # Redpanda + ClickHouse + OpenSearch (:9200)
 ├── opensearch/
@@ -208,7 +208,7 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
-> See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) for OpenSearch (Days 1–4).
+> See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) and [docs/phase-4-graduation.md](docs/phase-4-graduation.md).
 > See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) and [docs/phase-3-graduation.md](docs/phase-3-graduation.md).
 > See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).
 > Redis Streams code (`backend/redis_client.py`) remains as Days 1–4 learning history.
@@ -435,13 +435,12 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 | 1 | Agent → API → queue → PostgreSQL; aggregates; idempotency |
 | 2 | Kafka ingest bus, workers, DLQ, rate limits, `/pipeline` |
 | 3 | ClickHouse dual-write + analytics + PG vs CH compare |
-| 4 | OpenSearch — Day 1 index/health → Day 2+ log ingest/search |
+| 4 | OpenSearch logs — ingest, search, agent/API/worker shipping |
 
 ### Later phases
 
 | Phase | Focus |
 |-------|-------|
-| 4 | OpenSearch — centralized log search (in progress) |
 | 5 | OpenTelemetry — distributed tracing |
 | 6 | Sharding, multi-tenancy, rate limiting, usage metering |
 
@@ -474,6 +473,19 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 
 **Phase 3 graduation:** [docs/phase-3-graduation.md](docs/phase-3-graduation.md)  
 **Architecture:** [docs/phase-3-architecture.md](docs/phase-3-architecture.md)
+
+---
+
+## Learning goals (Phase 4)
+
+- [x] Run OpenSearch locally and define a logs index (`text` vs `keyword`)
+- [x] Ingest structured logs (`POST /logs`, `event_id` as `_id`)
+- [x] Search with full-text + filters (`GET /logs/search`)
+- [x] Ship logs from agent, API, and workers (best-effort)
+- [x] Document architecture and graduate Phase 4
+
+**Phase 4 graduation:** [docs/phase-4-graduation.md](docs/phase-4-graduation.md)  
+**Architecture:** [docs/phase-4-architecture.md](docs/phase-4-architecture.md)
 
 ---
 

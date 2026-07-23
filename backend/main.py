@@ -1,10 +1,9 @@
 """
-InsightNode API — metrics, logs, and Phase 5 Day 2 HTTP tracing.
+InsightNode API — metrics, logs, and OpenTelemetry traces (Phase 5 complete).
 
-Architecture (Phase 5 Day 2):
-    Metrics + logs unchanged.
-    Each HTTP request (except health/docs) becomes a Jaeger server span.
-    Kafka context propagation lands Day 3.
+Architecture (Phase 5):
+    Agent → FastAPI (HTTP spans) → Kafka (W3C headers) → worker (dual-write spans).
+    Spans export via OTLP → Jaeger; ops logs may carry attrs.trace_id.
 """
 
 from datetime import datetime
@@ -137,7 +136,7 @@ async def lifespan(app: FastAPI):
     shutdown_tracing()
 
 
-app = FastAPI(title="InsightNode", version="0.8.3", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.9.0", lifespan=lifespan)
 
 # Phase 5 Day 2: instrument BEFORE the ASGI server starts (cannot add middleware later).
 if setup_tracing():

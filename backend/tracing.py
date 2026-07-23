@@ -89,7 +89,7 @@ def setup_tracing(service_name: str | None = None) -> bool:
     tracer = trace.get_tracer("insightnode.tracing")
     with tracer.start_as_current_span("startup.bootstrap") as span:
         span.set_attribute("insightnode.phase", "5")
-        span.set_attribute("insightnode.day", "4")
+        span.set_attribute("insightnode.day", "5")
 
     logger.info(
         "OpenTelemetry tracing ready service=%s otlp=%s",

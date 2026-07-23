@@ -6,6 +6,7 @@ Phase 3 Day 2: each successful batch also inserts into ClickHouse.
 Phase 4 Day 4: ships structured ops logs for DLQ / delivery failures.
 Phase 5 Day 3: extract W3C trace context from Kafka headers → continue traces.
 Phase 5 Day 4: manual dual-write spans (PG + ClickHouse) under kafka.consume.
+Phase 5 complete: see docs/phase-5-graduation.md.
 """
 
 from __future__ import annotations

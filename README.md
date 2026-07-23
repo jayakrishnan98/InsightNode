@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 5 Day 4 — manual dual-write / logship spans**  
-**Next: Phase 5 Day 5 — docs + graduation**
+**Current stage: Phase 5 complete — OpenTelemetry + Jaeger**  
+**Next: Phase 6 — production SaaS concerns (sharding, multi-tenancy, metering)**
 
-Phase 5 Day 4 adds manual spans for PostgreSQL + ClickHouse dual-write and logship, plus `trace_id`/`span_id` on shipped logs for Jaeger ↔ OpenSearch correlation.
+Phase 5 delivers distributed tracing across agent → API → Kafka → worker, with manual dual-write / logship spans and `attrs.trace_id` on shipped logs.
 
 ---
 
@@ -14,22 +14,24 @@ Phase 5 Day 4 adds manual spans for PostgreSQL + ClickHouse dual-write and logsh
 InsightNode collects host metrics and structured logs from a local agent, ingests them through a FastAPI backend, stores metrics in PostgreSQL + ClickHouse, indexes logs in OpenSearch, and exposes query/search APIs.
 
 ```
-Agent (psutil + spool + logship)
-    │  POST /metrics {event_id, ...}
+Agent (psutil + spool + logship + OTEL)
+    │  POST /metrics {event_id, …}  (+ traceparent)
     │  POST /logs    {structured events}
     ▼
-FastAPI (rate limit) ──produce──► Kafka ──workers──► PostgreSQL
-  │ 202 / 429 / 503                 │            └─► ClickHouse
-  ├── GET /metrics (PG)             └─ DLQ topic     (+ worker logship)
+FastAPI (rate limit, HTTP spans) ──produce──► Kafka ──workers──► PostgreSQL
+  │ 202 / 429 / 503                    │  headers     └─► ClickHouse
+  ├── GET /metrics (PG)                └─ DLQ         (+ dual_write spans)
   ├── GET /metrics/aggregate (CH)
   ├── GET /metrics/aggregate/compare
   ├── POST /logs / GET /logs/search / GET /logs/{id}  (OpenSearch)
-  ├── GET /health          (+ clickhouse_ok, opensearch_ok)
+  ├── GET /health          (+ clickhouse_ok, opensearch_ok, jaeger_ok)
   ├── GET /pipeline
   └── GET /dlq
+         │
+         └── OTLP :4318 ──► Jaeger UI :16686
 ```
 
-### Features (Phase 1–4)
+### Features (Phase 1–5)
 
 | Component | Capability |
 |-----------|------------|
@@ -39,11 +41,11 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
 | **Workers** | Standalone consumers; dual-write PG + ClickHouse; commit after both |
 | **Query API** | Raw points (PG) + aggregations (CH) + timed compare |
 | **Idempotency** | `event_id` unique index in PostgreSQL |
-| **Ops** | `/health` (Kafka + ClickHouse), `/pipeline` (partition lag), `/dlq` |
+| **Ops** | `/health` (Kafka + CH + OS + Jaeger), `/pipeline`, `/dlq` |
 | **Agent resilience** | Retries + on-disk spool |
 | **ClickHouse** | Columnar analytics store (Phase 3 complete) |
-| **OpenSearch** | Centralized logs — ingest, search, agent/API/worker shipping (Phase 4 complete) |
-| **Jaeger (Day 4)** | Linked ingest traces; dual-write + logship spans; log `attrs.trace_id` |
+| **OpenSearch** | Centralized logs — ingest, search, shipping (Phase 4 complete) |
+| **Jaeger / OTEL** | Linked ingest traces; dual-write + logship spans; log `attrs.trace_id` |
 
 ---
 
@@ -54,8 +56,8 @@ InsightNode/
 ├── agent/
 │   ├── main.py
 │   ├── spool.py
-│   ├── logship.py           # Phase 4 Day 4 — POST /logs from agent
-│   ├── tracing.py           # Phase 5 Day 3 — CLIENT spans + HTTP inject
+│   ├── tracing.py           # Phase 5 — CLIENT spans + HTTP inject
+│   ├── logship.py           # Phase 4/5 — POST /logs (+ trace_id attrs)
 │   └── data/
 ├── backend/
 │   ├── main.py              # FastAPI — ingest, query, pipeline, dlq
@@ -63,8 +65,8 @@ InsightNode/
 │   ├── kafka_client.py      # Phase 2 Day 5–6 Kafka helpers (+ Day 3 headers)
 │   ├── clickhouse_client.py # Phase 3 — connect, insert, aggregate
 │   ├── opensearch_client.py # Phase 4 — index, get, search
-│   ├── logship.py           # Phase 4 Day 4 — API/worker → OpenSearch
-│   ├── tracing.py           # Phase 5 — OTEL setup, FastAPI, Kafka inject/extract
+│   ├── tracing.py           # Phase 5 — OTEL, FastAPI, Kafka, manual spans
+│   ├── logship.py           # Phase 4/5 — API/worker → OpenSearch (+ spans)
 │   ├── postgres_aggregate.py# Phase 3 Day 4 — PG aggregate for compare
 │   ├── rate_limit.py        # Phase 2 Day 6 ingest rate limit
 │   ├── redis_client.py      # Phase 2 Days 1–4 (history)
@@ -80,7 +82,8 @@ InsightNode/
 │   ├── phase-4-architecture.md
 │   ├── phase-4-graduation.md
 │   ├── phase-5-architecture.md
-│   └── ...
+│   ├── phase-5-graduation.md
+│   └── bottlenecks-and-roadmap.md
 ├── docker-compose.yml       # Redpanda + ClickHouse + OpenSearch + Jaeger
 ├── opensearch/
 │   └── logs_index.json      # insightnode-logs mapping
@@ -213,7 +216,7 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
-> See [docs/phase-5-architecture.md](docs/phase-5-architecture.md) for OpenTelemetry (Days 1–4).
+> See [docs/phase-5-architecture.md](docs/phase-5-architecture.md) and [docs/phase-5-graduation.md](docs/phase-5-graduation.md).
 > See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) and [docs/phase-4-graduation.md](docs/phase-4-graduation.md).
 > See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) and [docs/phase-3-graduation.md](docs/phase-3-graduation.md).
 > See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).
@@ -442,13 +445,12 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 | 2 | Kafka ingest bus, workers, DLQ, rate limits, `/pipeline` |
 | 3 | ClickHouse dual-write + analytics + PG vs CH compare |
 | 4 | OpenSearch logs — ingest, search, agent/API/worker shipping |
-| 5 | OpenTelemetry / Jaeger — Day 4 manual spans + trace↔log attrs |
+| 5 | OpenTelemetry / Jaeger — distributed tracing + dual-write spans |
 
 ### Later phases
 
 | Phase | Focus |
 |-------|-------|
-| 5 | OpenTelemetry — distributed tracing (in progress) |
 | 6 | Sharding, multi-tenancy, rate limiting, usage metering |
 
 ---
@@ -493,6 +495,20 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 
 **Phase 4 graduation:** [docs/phase-4-graduation.md](docs/phase-4-graduation.md)  
 **Architecture:** [docs/phase-4-architecture.md](docs/phase-4-architecture.md)
+
+---
+
+## Learning goals (Phase 5)
+
+- [x] Run Jaeger locally and export spans via OTLP
+- [x] Auto-instrument FastAPI HTTP requests
+- [x] Propagate W3C context across HTTP and Kafka
+- [x] Add manual spans for dual-write and logship
+- [x] Correlate logs with `attrs.trace_id` / `span_id`
+- [x] Document architecture and graduate Phase 5
+
+**Phase 5 graduation:** [docs/phase-5-graduation.md](docs/phase-5-graduation.md)  
+**Architecture:** [docs/phase-5-architecture.md](docs/phase-5-architecture.md)
 
 ---
 

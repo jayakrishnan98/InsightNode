@@ -163,6 +163,8 @@ See [phase-4-graduation.md](phase-4-graduation.md).
 - **Day 4:** Manual spans for dual-write / logship
 - **Day 5:** Docs + graduation
 
+See [phase-5-graduation.md](phase-5-graduation.md).
+
 ### Phase 6 — Production SaaS concerns
 
 - Sharding, multi-tenancy, rate limiting, usage metering

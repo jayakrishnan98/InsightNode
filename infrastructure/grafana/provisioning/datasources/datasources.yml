@@ -1,0 +1,37 @@
+# Provisioned datasources — clone-and-run (no manual Grafana UI setup).
+# Credentials come from Grafana container env (see docker-compose.yml).
+apiVersion: 1
+
+datasources:
+  - name: ClickHouse
+    uid: insightnode-clickhouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    isDefault: true
+    editable: false
+    jsonData:
+      host: ${CLICKHOUSE_HOST}
+      port: ${CLICKHOUSE_PORT}
+      protocol: http
+      defaultDatabase: ${CLICKHOUSE_DATABASE}
+      username: ${CLICKHOUSE_USER}
+      tlsSkipVerify: true
+    secureJsonData:
+      password: ${CLICKHOUSE_PASSWORD}
+
+  # Optional — Postgres runs on the host (not in Compose). Useful for relational
+  # metadata later; ClickHouse remains the default for time-series panels.
+  - name: PostgreSQL
+    uid: insightnode-postgres
+    type: postgres
+    access: proxy
+    url: ${POSTGRES_HOST}:${POSTGRES_PORT}
+    user: ${POSTGRES_USER}
+    editable: false
+    jsonData:
+      database: ${POSTGRES_DATABASE}
+      sslmode: disable
+      postgresVersion: 1400
+      timescaledb: false
+    secureJsonData:
+      password: ${POSTGRES_PASSWORD}

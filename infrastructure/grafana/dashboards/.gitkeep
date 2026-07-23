@@ -1,0 +1,2 @@
+# Dashboard JSON files go here (next phase).
+# Mounted read-only into Grafana at /var/lib/grafana/dashboards.

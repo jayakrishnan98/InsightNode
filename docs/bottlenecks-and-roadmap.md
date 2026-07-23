@@ -173,4 +173,4 @@ See [phase-5-graduation.md](phase-5-graduation.md).
 - **Day 4:** Usage metering + simple quotas
 - **Day 5:** Sharding concepts + docs + graduation
 
-See [phase-6-architecture.md](phase-6-architecture.md).
+See [phase-6-architecture.md](phase-6-architecture.md) and [phase-6-graduation.md](phase-6-graduation.md).

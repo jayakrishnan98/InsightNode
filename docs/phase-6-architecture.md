@@ -2,57 +2,71 @@
 
 Phase 6 turns InsightNode from a single-operator lab into a **multi-tenant** learning SaaS: identify who is calling, isolate their data, limit and meter usage, and understand sharding by tenant.
 
+**Status:** Phase 6 complete (Days 1–5). See [phase-6-graduation.md](phase-6-graduation.md).
+
 ```
-Phase 5:  metrics + logs + traces (three pillars)
-Day 1:    Tenant registry + X-API-Key identity
-Day 2:    Persist / query by tenant_id (storage isolation)
-Day 3:    Per-tenant rate limits (upgrade from machine_id)
-Day 4:    Usage metering + simple quotas  ← YOU ARE HERE
-Day 5:    Sharding concepts + docs + graduation
+Day 1:  Tenant registry + X-API-Key identity
+Day 2:  Persist / query by tenant_id (storage isolation)
+Day 3:  Per-tenant rate limits (upgrade from machine_id)
+Day 4:  Usage metering + simple quotas
+Day 5:  Sharding concepts + docs + graduation
 ```
 
 ---
 
-## Current architecture (Day 4)
+## End-state architecture
 
 ```mermaid
-flowchart LR
+flowchart TB
   Agent -->|X-API-Key| API[FastAPI]
-  API -->|429 burst| RL[RateLimiter in-memory]
-  API -->|402 monthly| Q[(tenant_usage PG)]
-  RL -->|ok| Q
-  Q -->|ok| Store[(Kafka / OpenSearch)]
+  API --> T[(tenants)]
+  API -->|429| RL[RateLimiter]
+  API -->|402| U[(tenant_usage)]
+  API -->|key=tenant_id| K[(Kafka)]
+  K --> W[workers]
+  W --> PG[(PostgreSQL)]
+  W --> CH[(ClickHouse)]
+  API --> OS[(OpenSearch)]
+  API -->|GET /usage + shard_id| Agent
 ```
 
-| Control | Window | HTTP | Store |
-|---------|--------|------|-------|
-| Rate limit (Day 3) | Sliding seconds | **429** | In-memory |
-| Quota (Day 4) | UTC calendar month | **402** | PostgreSQL `tenant_usage` |
-
-### What is counted
-
-| Ingest | Counters |
-|--------|----------|
-| `POST /metrics` | `metric_events` += 1, `metric_points` += len(metrics) |
-| `POST /logs` | `log_events` += len(logs) |
-
-Usage is recorded **after** a successful accept (failed Kafka/OpenSearch is not billed).
+| Day | Capability |
+|-----|------------|
+| 1 | `tenants` + `X-API-Key` → `tenant_id` |
+| 2 | `tenant_id` on PG / CH / OS; scoped queries |
+| 3 | Sliding-window limit per tenant (**429**) |
+| 4 | Monthly usage + quotas (**402**); `GET /usage` |
+| 5 | Logical `shard_id`; Kafka key = `tenant_id` |
 
 ---
 
-## Day 4 lesson — throttle ≠ bill
+## Day 5 lesson — shard by tenant
 
 ```
-429  →  slow down (burst)
-402  →  plan exhausted (buy more / wait for next month)
+shard_id = crc32(tenant_id) % NUM_SHARDS   # stable, local learning aid
+Kafka key = tenant_id                      # partition affinity today
 ```
 
-| Config | Default |
-|--------|---------|
-| `QUOTA_METRIC_EVENTS_MONTHLY` | `100000` |
-| `QUOTA_LOG_EVENTS_MONTHLY` | `100000` |
-| `QUOTA_METRIC_POINTS_MONTHLY` | `500000` |
-| `tenants.quota_*` | Optional per-tenant override (`NULL` → env default) |
+| Layer | What InsightNode does | Production next step |
+|-------|----------------------|----------------------|
+| Kafka | Produce key = `tenant_id` | Same — keeps a tenant on fewer partitions |
+| PostgreSQL / CH | Row filter + `ORDER BY` leads with `tenant_id` | Separate DBs / cells per shard range |
+| OpenSearch | `tenant_id` keyword filter | Index-per-tenant or routing key |
+| API | `GET /usage` → `sharding.shard_id` | Route to the cell that owns that shard |
+
+**Why tenant (not machine)?** Billing, isolation, and support are per customer. A hot machine is a fairness problem; a hot *tenant* is a capacity-planning problem.
+
+`INSIGHTNODE_NUM_SHARDS` (default `4`) configures the logical model only — this repo still runs one local stack.
+
+---
+
+## Controls cheat sheet
+
+| Control | Window | Status | Store |
+|---------|--------|--------|-------|
+| Rate limit | Seconds | **429** | In-memory |
+| Quota | UTC month | **402** | `tenant_usage` |
+| Isolation | Forever | filter / 404 | PG / CH / OS |
 
 ---
 
@@ -60,18 +74,16 @@ Usage is recorded **after** a successful accept (failed Kafka/OpenSearch is not 
 
 ```bash
 curl -H "X-API-Key: dev-local-key" http://127.0.0.1:8001/usage
+# → usage, quotas, remaining, sharding.shard_id
 
-# Lab: tiny quota then burn it
-psql "$DATABASE_URL" -c "UPDATE tenants SET quota_metric_events = 3 WHERE tenant_id = 'local';"
-
-# After a few POSTs → 402 Payment Required
-curl -H "X-API-Key: dev-local-key" http://127.0.0.1:8001/usage
+curl http://127.0.0.1:8001/tenants
 ```
 
 ---
 
-## What Day 4 deliberately does not include
+## Deliberately out of scope
 
-- Invoice generation / Stripe billing
-- Soft vs hard quotas / overage fees
-- Physical sharding → **Day 5**
+- Multi-region cells / Vitess / Citus
+- Cross-shard fan-out queries
+- Sticky “whale tenant” assignment tables
+- Stripe invoices / soft overage billing

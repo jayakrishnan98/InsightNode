@@ -79,7 +79,7 @@ def get_producer() -> KafkaProducer:
     Shared Kafka producer for the API (Phase 2 Day 6).
 
     Logic:
-        - JSON serializers; key = machine_id for per-host partition affinity.
+        - JSON serializers; key = tenant_id (Phase 6 Day 5) for shard affinity.
         - acks=all + retries; max_in_flight=1 so retries don't reorder.
         - linger_ms batches tiny produces without hurting agent latency much.
 
@@ -129,12 +129,14 @@ def enqueue_payload(producer: KafkaProducer, payload: dict[str, Any]) -> None:
     Logic:
         - Soft backpressure: if consumer lag estimate >= max → QueueFullError.
         - Start a PRODUCER span, inject W3C trace context into Kafka headers,
-          then produce(key=machine_id, value=payload, headers=...) and flush.
+          then produce(key=tenant_id or machine_id, value=payload, headers=...).
 
     Reason:
         Agents get 503 when workers fall far behind — same idea as Redis XLEN cap.
         Headers carry the active HTTP/request span so the worker continues the
         same trace_id (Phase 5 Day 3).
+        Phase 6 Day 5: prefer tenant_id as the Kafka key so one customer's
+        traffic hashes to fewer partitions (shard affinity / ordering).
     """
     from backend.tracing import kafka_headers_from_context, kafka_produce_span
 
@@ -144,11 +146,14 @@ def enqueue_payload(producer: KafkaProducer, payload: dict[str, Any]) -> None:
             f"Ingest topic lag too high ({lag}/{QUEUE_MAX_LENGTH})"
         )
 
-    key = payload.get("machine_id")
+    # Tenant-first key (Phase 6 Day 5); fall back to machine for legacy payloads.
+    key = payload.get("tenant_id") or payload.get("machine_id")
     with kafka_produce_span(INGEST_TOPIC) as span:
         event_id = payload.get("event_id")
         if event_id:
             span.set_attribute("insightnode.event_id", str(event_id))
+        if payload.get("tenant_id"):
+            span.set_attribute("insightnode.tenant_id", str(payload["tenant_id"]))
         headers = kafka_headers_from_context()
         future = producer.send(
             INGEST_TOPIC,

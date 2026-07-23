@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 6 Day 4 — usage metering + quotas**  
-**Next: Phase 6 Day 5 — sharding concepts + graduation**
+**Current stage: Phase 6 complete — multi-tenant SaaS controls**  
+**Next: Open-ended experiments (deeper pillars, multi-cell sharding, …)**
 
-Phase 6 Day 4 tracks monthly ingest usage in PostgreSQL and rejects with **402** when plan quotas are exceeded (distinct from Day 3's **429** rate limits).
+Phase 6 delivers tenant identity, storage isolation, per-tenant rate limits, monthly quotas, and logical shard affinity (Kafka key = `tenant_id`).
 
 ---
 
@@ -25,6 +25,7 @@ FastAPI (rate limit, HTTP spans) ──produce──► Kafka ──workers─�
   ├── GET /metrics/aggregate/compare
   ├── POST /logs / GET /logs/search / GET /logs/{id}  (OpenSearch)
   ├── GET /health          (+ clickhouse_ok, opensearch_ok, jaeger_ok)
+  ├── GET /tenants / GET /usage   (tenancy + quotas + shard_id)
   ├── GET /pipeline
   └── GET /dlq
          │
@@ -46,7 +47,7 @@ FastAPI (rate limit, HTTP spans) ──produce──► Kafka ──workers─�
 | **ClickHouse** | Columnar analytics store (Phase 3 complete) |
 | **OpenSearch** | Centralized logs — ingest, search, shipping (Phase 4 complete) |
 | **Jaeger / OTEL** | Linked ingest traces; dual-write + logship spans; log `attrs.trace_id` |
-| **Tenancy (Day 4)** | Monthly `tenant_usage` metering; quotas → 402; `GET /usage` |
+| **Tenancy (Phase 6)** | API keys, isolated storage, rate limits, quotas, logical shards |
 
 ---
 
@@ -67,8 +68,9 @@ InsightNode/
 │   ├── clickhouse_client.py # Phase 3 — connect, insert, aggregate
 │   ├── opensearch_client.py # Phase 4 — index, get, search
 │   ├── tracing.py           # Phase 5 — OTEL, FastAPI, Kafka, manual spans
-│   ├── tenancy.py           # Phase 6 — tenants + X-API-Key resolve
-│   ├── metering.py          # Phase 6 Day 4 — usage counters + quotas
+│   ├── tenancy.py           # Phase 6 — tenants + X-API-Key
+│   ├── metering.py          # Phase 6 Day 4 — usage + quotas
+│   ├── sharding.py          # Phase 6 Day 5 — logical shard_id
 │   ├── rate_limit.py        # Phase 2/6 — sliding-window ingest limits
 │   ├── logship.py           # Phase 4/5 — API/worker → OpenSearch (+ spans)
 │   ├── postgres_aggregate.py# Phase 3 Day 4 — PG aggregate for compare
@@ -88,6 +90,7 @@ InsightNode/
 │   ├── phase-5-architecture.md
 │   ├── phase-5-graduation.md
 │   ├── phase-6-architecture.md
+│   ├── phase-6-graduation.md
 │   └── bottlenecks-and-roadmap.md
 ├── docker-compose.yml       # Redpanda + ClickHouse + OpenSearch + Jaeger
 ├── opensearch/
@@ -221,7 +224,7 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
-> See [docs/phase-6-architecture.md](docs/phase-6-architecture.md) for multi-tenancy (Day 1+).
+> See [docs/phase-6-architecture.md](docs/phase-6-architecture.md) and [docs/phase-6-graduation.md](docs/phase-6-graduation.md).
 > See [docs/phase-5-architecture.md](docs/phase-5-architecture.md) and [docs/phase-5-graduation.md](docs/phase-5-graduation.md).
 > See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) and [docs/phase-4-graduation.md](docs/phase-4-graduation.md).
 > See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) and [docs/phase-3-graduation.md](docs/phase-3-graduation.md).
@@ -453,14 +456,13 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 | 3 | ClickHouse dual-write + analytics + PG vs CH compare |
 | 4 | OpenSearch logs — ingest, search, agent/API/worker shipping |
 | 5 | OpenTelemetry / Jaeger — distributed tracing + dual-write spans |
-| 6 | Multi-tenancy — Day 4 usage metering + quotas (in progress) |
+| 6 | Multi-tenancy — identity, isolation, limits, quotas, shard affinity |
 
 ### Later phases
 
 | Phase | Focus |
 |-------|-------|
-| 6 (rest) | Tenant isolation, per-tenant limits, metering, sharding |
-
+| — | Open-ended: multi-cell routing, retention, percentiles, billing |
 ---
 
 ## Learning goals (Phase 1)
@@ -518,6 +520,20 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 
 **Phase 5 graduation:** [docs/phase-5-graduation.md](docs/phase-5-graduation.md)  
 **Architecture:** [docs/phase-5-architecture.md](docs/phase-5-architecture.md)
+
+---
+
+## Learning goals (Phase 6)
+
+- [x] Register tenants and authenticate with API keys
+- [x] Isolate metrics/logs storage and queries by `tenant_id`
+- [x] Rate-limit ingest per tenant (burst)
+- [x] Meter monthly usage and enforce quotas
+- [x] Reason about tenant-based sharding (logical shard + Kafka affinity)
+- [x] Document architecture and graduate Phase 6
+
+**Phase 6 graduation:** [docs/phase-6-graduation.md](docs/phase-6-graduation.md)  
+**Architecture:** [docs/phase-6-architecture.md](docs/phase-6-architecture.md)
 
 ---
 

@@ -1,9 +1,9 @@
 """
-InsightNode API — multi-tenant SaaS controls through Phase 6 Day 4.
+InsightNode API — multi-tenant SaaS learning stack (Phase 6 complete).
 
-Architecture (Phase 6 Day 4):
-    Rate limit (429, burst) + monthly quota (402, plan) before ingest.
-    GET /usage shows current UTC-month counters vs ceilings.
+Architecture (Phase 6):
+    Identity → isolation → rate limits → quotas → logical tenant sharding.
+    Kafka produce keys by tenant_id for partition affinity (Day 5).
 """
 
 from datetime import datetime
@@ -57,6 +57,7 @@ from backend.rate_limit import (
 )
 from backend import logship as backend_logship
 from backend.metering import check_quota, get_usage, record_usage
+from backend.sharding import shard_info
 from backend.tenancy import (
     DEFAULT_TENANT_ID,
     TENANCY_STRICT,
@@ -151,7 +152,7 @@ async def lifespan(app: FastAPI):
     shutdown_tracing()
 
 
-app = FastAPI(title="InsightNode", version="0.10.3", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.11.0", lifespan=lifespan)
 
 # Phase 5 Day 2: instrument BEFORE the ASGI server starts (cannot add middleware later).
 if setup_tracing():
@@ -333,13 +334,15 @@ def get_tenants():
 @app.get("/usage")
 def get_tenant_usage(tenant: TenantContext = Depends(require_tenant)):
     """
-    Current UTC-month usage vs quotas for the authenticated tenant (Phase 6 Day 4).
+    Current UTC-month usage vs quotas + logical shard (Phase 6 Day 4–5).
 
     Reason:
-        Customers (and labs) need to see how close they are to plan ceilings —
-        distinct from Day 3's short sliding-window rate limit.
+        Customers need plan visibility; shard_id teaches how a multi-cell
+        deploy would route this tenant without running multiple databases yet.
     """
-    return get_usage(tenant.tenant_id)
+    body = get_usage(tenant.tenant_id)
+    body["sharding"] = shard_info(tenant.tenant_id)
+    return body
 
 
 @app.get("/pipeline")

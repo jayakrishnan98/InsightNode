@@ -1,3 +1,9 @@
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+frontend/out/
+
 # Python
 venv/
 __pycache__/

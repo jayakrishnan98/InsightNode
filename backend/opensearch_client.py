@@ -3,7 +3,7 @@ OpenSearch client for Phase 4.
 
 Day 1: connect, ensure logs index, health ping.
 Day 2: index_logs() / get_log() for POST /logs ingest.
-Day 3: search (not yet).
+Day 3: search_logs() for GET /logs/search.
 """
 
 from __future__ import annotations
@@ -199,6 +199,105 @@ def get_log(event_id: str) -> dict[str, Any] | None:
     if not isinstance(source, dict):
         return None
     return source
+
+
+def search_logs(
+    *,
+    q: str | None = None,
+    machine_id: str | None = None,
+    service: str | None = None,
+    level: str | None = None,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """
+    Search insightnode-logs with full-text + structured filters (Phase 4 Day 3).
+
+    Logic:
+        - bool.query: must = match on message (if q); filter = exact + time range.
+        - Filters use keyword fields (no scoring) — cheap and cacheable.
+        - Sort timestamp desc; paginate with from/size.
+
+    Reason:
+        Dashboards need "find errors mentioning disk on host X last hour".
+        Separating text match (must) from exact filters matches how Datadog /
+        OpenSearch query DSL is typically used.
+    """
+    must: list[dict[str, Any]] = []
+    filters: list[dict[str, Any]] = []
+
+    if q:
+        must.append({"match": {"message": {"query": q, "operator": "and"}}})
+
+    if machine_id:
+        filters.append({"term": {"machine_id": machine_id}})
+    if service:
+        filters.append({"term": {"service": service}})
+    if level:
+        filters.append({"term": {"level": level}})
+
+    if start_time is not None or end_time is not None:
+        time_range: dict[str, str] = {}
+        if start_time is not None:
+            time_range["gte"] = _as_utc_iso(start_time)
+        if end_time is not None:
+            time_range["lt"] = _as_utc_iso(end_time)
+        filters.append({"range": {"timestamp": time_range}})
+
+    if not must and not filters:
+        # Empty search → recent logs (match_all)
+        query: dict[str, Any] = {"match_all": {}}
+    else:
+        bool_body: dict[str, Any] = {}
+        if must:
+            bool_body["must"] = must
+        else:
+            bool_body["must"] = [{"match_all": {}}]
+        if filters:
+            bool_body["filter"] = filters
+        query = {"bool": bool_body}
+
+    body = {
+        "query": query,
+        "from": offset,
+        "size": limit,
+        "sort": [{"timestamp": {"order": "desc"}}],
+    }
+
+    result = get_client().search(index=LOGS_INDEX, body=body)
+    hits = result.get("hits", {})
+    total = hits.get("total", {})
+    if isinstance(total, dict):
+        total_count = int(total.get("value", 0))
+    else:
+        total_count = int(total or 0)
+
+    logs = []
+    for hit in hits.get("hits", []):
+        source = hit.get("_source") or {}
+        logs.append(
+            {
+                "event_id": source.get("event_id") or hit.get("_id"),
+                "machine_id": source.get("machine_id"),
+                "service": source.get("service"),
+                "level": source.get("level"),
+                "message": source.get("message"),
+                "timestamp": source.get("timestamp"),
+                "attrs": source.get("attrs") or {},
+                "score": hit.get("_score"),
+            }
+        )
+
+    logger.info(
+        "OpenSearch search q=%r filters=%s total=%s returned=%s",
+        q,
+        {"machine_id": machine_id, "service": service, "level": level},
+        total_count,
+        len(logs),
+    )
+    return {"total": total_count, "count": len(logs), "logs": logs}
 
 
 def close_client() -> None:

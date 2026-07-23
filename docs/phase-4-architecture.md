@@ -5,15 +5,15 @@ Phase 4 adds centralized **log search**. Metrics stay on the Phase 2–3 path (K
 ```
 Phase 3:  metrics → Kafka → PG + ClickHouse; aggregate on CH
 Day 1:    + OpenSearch up (index + health)
-Day 2:    POST /logs → OpenSearch                    ← YOU ARE HERE
-Day 3:    GET /logs/search full-text + filters
+Day 2:    POST /logs → OpenSearch
+Day 3:    GET /logs/search full-text + filters         ← YOU ARE HERE
 Day 4:    Agent / API structured log shipping
 Day 5:    Docs + graduation
 ```
 
 ---
 
-## Current architecture (Day 2)
+## Current architecture (Day 3)
 
 ```mermaid
 flowchart LR
@@ -24,28 +24,66 @@ flowchart LR
   W --> CH[(ClickHouse)]
   Client -->|POST /logs| API
   API -->|bulk index| OS[(OpenSearch)]
+  Client -->|GET /logs/search| OS
   Client -->|GET /logs/event_id| OS
 ```
 
 | Signal | Path | Why |
 |--------|------|-----|
-| Metrics | Kafka → PG + CH | Numbers / aggregates / durable bus |
-| Logs | `POST /logs` → OpenSearch | Text events; Day 2 learns the document model first |
-
-Day 2 indexes **directly** (no Kafka log topic yet). That keeps the lesson on OpenSearch documents / `_id` / bulk index. A durable log bus can mirror metrics later if you want.
+| Metrics | Kafka → PG + CH | Numbers / aggregates |
+| Logs | OpenSearch | Full-text + keyword filters |
 
 ---
 
-## Day 2 lesson — documents, not rows
+## Day 3 lesson — search vs get-by-id
 
-| Concept | InsightNode usage |
-|---------|-------------------|
-| Index | `insightnode-logs` (like a table) |
-| Document | One structured log event |
-| `_id` | = `event_id` → re-POST overwrites (idempotent-ish) |
-| `keyword` fields | Exact filters (`level`, `machine_id`, `service`) |
-| `text` field | `message` — analyzed for Day 3 full-text search |
-| Bulk index | Many logs in one HTTP round-trip |
+| API | What it does |
+|-----|----------------|
+| `GET /logs/{event_id}` | Direct document lookup by `_id` (Day 2) |
+| `GET /logs/search` | Query DSL: text match + filters + time range |
+
+OpenSearch `bool` query shape we use:
+
+```
+must:   match message   ← scored full-text (optional)
+filter: term / range    ← exact level, host, service, time (not scored)
+```
+
+| Concept | Why it matters |
+|---------|----------------|
+| `text` (`message`) | Analyzed tokens — "disk usage" finds that phrase |
+| `keyword` (`level`, …) | Exact equality — `level=error` |
+| `filter` context | Faster, cacheable; does not affect `_score` |
+| `must` / `match` | Relevance ranking when you pass `q` |
+
+Route order matters: `/logs/search` is registered **before** `/logs/{event_id}` so FastAPI does not treat `"search"` as an event id.
+
+---
+
+## APIs
+
+### `POST /logs` (Day 2)
+
+Bulk index; `event_id` = document `_id`.
+
+### `GET /logs/search` (Day 3)
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `q` | string | Full-text on `message` (AND) |
+| `machine_id` | string | Exact host |
+| `service` | string | Exact service |
+| `level` | string | `debug` / `info` / `warn` / `error` |
+| `start_time` / `end_time` | ISO 8601 | Time range (`end` exclusive) |
+| `limit` / `offset` | int | Pagination (newest first) |
+
+```bash
+curl "http://127.0.0.1:8001/logs/search?q=disk&level=warn&limit=10"
+```
+
+### `GET /logs/{event_id}` (Day 2)
+
+Fetch one document by id.
 
 ---
 
@@ -53,43 +91,11 @@ Day 2 indexes **directly** (no Kafka log topic yet). That keeps the lesson on Op
 
 Source: [`opensearch/logs_index.json`](../opensearch/logs_index.json)
 
-| Field | Type | Why |
-|-------|------|-----|
-| `timestamp` | `date` | Time-range filters |
-| `machine_id` | `keyword` | Exact host filter |
-| `service` | `keyword` | Exact service filter (`agent`, `api`, `worker`) |
-| `level` | `keyword` | `debug` / `info` / `warn` / `error` |
-| `message` | `text` | Full-text search (Day 3) |
-| `event_id` | `keyword` | Correlation + document `_id` |
-| `attrs` | `object` | Extra structured fields |
-
----
-
-## APIs (Day 2)
-
-### `POST /logs`
-
-```bash
-curl -s -X POST http://127.0.0.1:8001/logs \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "logs": [{
-      "event_id": "550e8400-e29b-41d4-a716-446655440000",
-      "machine_id": "my-machine",
-      "service": "agent",
-      "level": "warn",
-      "message": "disk usage high on /",
-      "timestamp": "2026-07-23T08:00:00+00:00",
-      "attrs": {"path": "/", "percent": 92}
-    }]
-  }'
-```
-
-Returns `202` with `{ status, indexed, ids }`.
-
-### `GET /logs/{event_id}`
-
-Fetch one document by id (lab verification). Full search is Day 3.
+| Field | Type | Role in Day 3 |
+|-------|------|----------------|
+| `message` | `text` | `q` full-text |
+| `machine_id` / `service` / `level` | `keyword` | Exact filters |
+| `timestamp` | `date` | Range filter + sort |
 
 ---
 
@@ -99,23 +105,16 @@ Fetch one document by id (lab verification). Full search is Day 3.
 docker compose up -d
 uvicorn backend.main:app --reload --port 8001
 
-curl http://127.0.0.1:8001/health
-# expect opensearch_ok: true
+# Index a sample, then search
+curl -s -X POST http://127.0.0.1:8001/logs -H 'Content-Type: application/json' -d '{...}'
+curl "http://127.0.0.1:8001/logs/search?q=disk&level=warn"
 ```
-
-Env overrides (optional):
-
-| Variable | Default |
-|----------|---------|
-| `OPENSEARCH_HOST` | `localhost` |
-| `OPENSEARCH_PORT` | `9200` |
-| `OPENSEARCH_LOGS_INDEX` | `insightnode-logs` |
 
 ---
 
-## What Day 2 deliberately does not include
+## What Day 3 deliberately does not include
 
-- Full-text `GET /logs/search` → **Day 3**
 - Agent auto log shipping → **Day 4**
 - Kafka topic for logs → later / optional
+- Aggregations / log patterns / alerting → later
 - OpenSearch Dashboards UI → optional later

@@ -1,10 +1,10 @@
 """
-InsightNode API — metrics + Phase 4 log ingest.
+InsightNode API — metrics + Phase 4 logs.
 
-Architecture (Phase 4 Day 2):
+Architecture (Phase 4 Day 3):
     Metrics: Kafka → workers → PostgreSQL + ClickHouse (unchanged).
-    Logs:    POST /logs → OpenSearch (insightnode-logs), keyed by event_id.
-    Search:  Day 3.
+    Logs:    POST /logs → OpenSearch; GET /logs/search (full-text + filters);
+             GET /logs/{event_id} by id.
 """
 
 from datetime import datetime
@@ -34,6 +34,7 @@ from backend.opensearch_client import (
     get_log as opensearch_get_log,
     index_logs as opensearch_index_logs,
     ping as opensearch_ping,
+    search_logs as opensearch_search_logs,
 )
 from backend.postgres_aggregate import query_aggregate as postgres_query_aggregate
 from backend.kafka_client import (
@@ -124,7 +125,7 @@ async def lifespan(app: FastAPI):
     close_opensearch()
 
 
-app = FastAPI(title="InsightNode", version="0.6.1", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.6.2", lifespan=lifespan)
 
 class Metric(BaseModel):
     """Single metric reading inside an ingestion payload (name, value, unit)."""
@@ -234,6 +235,25 @@ class LogsIngestResponse(BaseModel):
     ids: list[str]
 
 
+class LogSearchHit(BaseModel):
+    """One hit from GET /logs/search."""
+    event_id: str
+    machine_id: str
+    service: str
+    level: str
+    message: str
+    timestamp: datetime | str
+    attrs: dict[str, Any] = Field(default_factory=dict)
+    score: float | None = None
+
+
+class LogsSearchResponse(BaseModel):
+    """Wrapper for OpenSearch log search results."""
+    total: int
+    count: int
+    logs: list[LogSearchHit]
+
+
 @app.get("/health")
 def health_check():
     """
@@ -335,6 +355,59 @@ def ingest_logs(payload: LogsPayload):
         status="accepted",
         indexed=result["indexed"],
         ids=result["ids"],
+    )
+
+
+@app.get("/logs/search", response_model=LogsSearchResponse)
+def search_logs(
+    q: Optional[str] = Query(
+        None,
+        description="Full-text query against message (AND operator)",
+        examples=["disk usage"],
+    ),
+    machine_id: Optional[str] = Query(None, examples=["my-machine"]),
+    service: Optional[str] = Query(None, examples=["agent"]),
+    level: Optional[Literal["debug", "info", "warn", "error"]] = Query(None),
+    start_time: Optional[datetime] = Query(None, examples=["2026-07-23T00:00:00+00:00"]),
+    end_time: Optional[datetime] = Query(None, examples=["2026-07-24T00:00:00+00:00"]),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0, le=10_000),
+):
+    """
+    Search logs in OpenSearch (Phase 4 Day 3).
+
+    Logic:
+        - Optional full-text `q` on message (scored).
+        - Optional exact filters: machine_id, service, level.
+        - Optional time range on timestamp.
+        - Newest first; paginate with limit/offset.
+
+    Reason:
+        Finding "warn disk on host X" is the core log use case — not SQL LIKE.
+        Must register this route before /logs/{event_id} so "search" is not an id.
+    """
+    if start_time is not None and end_time is not None and start_time >= end_time:
+        raise HTTPException(status_code=400, detail="start_time must be before end_time")
+
+    try:
+        result = opensearch_search_logs(
+            q=q,
+            machine_id=machine_id,
+            service=service,
+            level=level,
+            start_time=start_time,
+            end_time=end_time,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception:
+        logger.exception("OpenSearch log search failed")
+        raise HTTPException(status_code=503, detail="OpenSearch log search failed")
+
+    return LogsSearchResponse(
+        total=result["total"],
+        count=result["count"],
+        logs=[LogSearchHit(**hit) for hit in result["logs"]],
     )
 
 

@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 4 Day 2 — log ingest into OpenSearch**  
-**Next: Phase 4 Day 3 — full-text log search**
+**Current stage: Phase 4 Day 3 — log search**  
+**Next: Phase 4 Day 4 — agent / API structured log shipping**
 
-Phase 4 Day 2 adds `POST /logs` (bulk index into OpenSearch) and `GET /logs/{event_id}` for verification. Metrics path is unchanged.
+Phase 4 Day 3 adds `GET /logs/search` (full-text on `message` + keyword/time filters). Ingest remains `POST /logs`.
 
 ---
 
@@ -23,6 +23,7 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
   ├── GET /metrics/aggregate (CH)
   ├── GET /metrics/aggregate/compare
   ├── POST /logs             (OpenSearch)
+  ├── GET /logs/search
   ├── GET /logs/{event_id}
   ├── GET /health          (+ clickhouse_ok, opensearch_ok)
   ├── GET /pipeline
@@ -42,7 +43,7 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
 | **Ops** | `/health` (Kafka + ClickHouse), `/pipeline` (partition lag), `/dlq` |
 | **Agent resilience** | Retries + on-disk spool |
 | **ClickHouse** | Columnar analytics store (Phase 3 complete) |
-| **OpenSearch (Day 2)** | `POST /logs` bulk index + `GET /logs/{event_id}` |
+| **OpenSearch (Day 3)** | Ingest + full-text search with filters |
 
 ---
 
@@ -59,7 +60,7 @@ InsightNode/
 │   ├── worker.py            # Kafka consumer → PostgreSQL + ClickHouse
 │   ├── kafka_client.py      # Phase 2 Day 5–6 Kafka helpers
 │   ├── clickhouse_client.py # Phase 3 — connect, insert, aggregate
-│   ├── opensearch_client.py # Phase 4 — connect, index_logs, get_log
+│   ├── opensearch_client.py # Phase 4 — index, get, search
 │   ├── postgres_aggregate.py# Phase 3 Day 4 — PG aggregate for compare
 │   ├── rate_limit.py        # Phase 2 Day 6 ingest rate limit
 │   ├── redis_client.py      # Phase 2 Days 1–4 (history)
@@ -205,7 +206,7 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
-> See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) for OpenSearch (Days 1–2).
+> See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) for OpenSearch (Days 1–3).
 > See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) and [docs/phase-3-graduation.md](docs/phase-3-graduation.md).
 > See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).
 > Redis Streams code (`backend/redis_client.py`) remains as Days 1–4 learning history.
@@ -306,10 +307,25 @@ curl -s -X POST http://127.0.0.1:8001/logs \
 
 ### `GET /logs/{event_id}` — Fetch one log by id
 
-Verification helper until Day 3 search.
+Verification helper for direct document lookup.
 
 ```bash
 curl http://127.0.0.1:8001/logs/550e8400-e29b-41d4-a716-446655440000
+```
+
+### `GET /logs/search` — Full-text + filters (Phase 4 Day 3)
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `q` | No | Full-text query on `message` |
+| `machine_id` | No | Exact host filter |
+| `service` | No | Exact service filter |
+| `level` | No | `debug` / `info` / `warn` / `error` |
+| `start_time` / `end_time` | No | Time range |
+| `limit` / `offset` | No | Pagination (default limit 50) |
+
+```bash
+curl "http://127.0.0.1:8001/logs/search?q=disk&level=warn&limit=10"
 ```
 
 ### `GET /health` — Pipeline health

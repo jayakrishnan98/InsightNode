@@ -7,6 +7,7 @@
   "mappings": {
     "properties": {
       "timestamp": { "type": "date" },
+      "tenant_id": { "type": "keyword" },
       "machine_id": { "type": "keyword" },
       "service": { "type": "keyword" },
       "level": { "type": "keyword" },

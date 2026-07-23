@@ -32,6 +32,7 @@ PG_INTERVAL_MAP: dict[str, str] = {
 def query_aggregate(
     db: Session,
     *,
+    tenant_id: str,
     machine_id: str,
     metric_name: str,
     start_time: datetime,
@@ -42,6 +43,7 @@ def query_aggregate(
     Aggregate metrics with PostgreSQL date_bin (legacy analytics path).
 
     Logic:
+        - Filter by tenant_id (Phase 6 Day 2).
         - Map interval → allowlisted PG interval literal.
         - date_bin(width, timestamp, origin) for bucket starts.
         - AVG / MIN / MAX / COUNT grouped by machine, metric, bucket.
@@ -70,6 +72,7 @@ def query_aggregate(
             func.max(MetricRecord.value).label("max"),
             func.count().label("sample_count"),
         )
+        .where(MetricRecord.tenant_id == tenant_id)
         .where(MetricRecord.machine_id == machine_id)
         .where(MetricRecord.metric_name == metric_name)
         .where(MetricRecord.timestamp >= start_time)

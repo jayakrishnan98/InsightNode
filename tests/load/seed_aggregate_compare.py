@@ -42,6 +42,7 @@ from backend.models import MetricRecord
 
 def build_rows(
     *,
+    tenant_id: str,
     machine_id: str,
     metric_name: str,
     n: int,
@@ -55,6 +56,7 @@ def build_rows(
         value = 50.0 + 20.0 * math.sin(i / 17.0)
         rows.append(
             {
+                "tenant_id": tenant_id,
                 "machine_id": machine_id,
                 "metric_name": metric_name,
                 "value": value,
@@ -74,7 +76,7 @@ def insert_postgres(rows: list[dict], batch_size: int = 2000) -> int:
             chunk = rows[i : i + batch_size]
             stmt = insert(MetricRecord).values(chunk)
             stmt = stmt.on_conflict_do_nothing(
-                index_elements=["machine_id", "event_id", "metric_name"],
+                index_elements=["tenant_id", "machine_id", "event_id", "metric_name"],
                 index_where=text("event_id IS NOT NULL"),
             )
             result = db.execute(stmt)
@@ -97,6 +99,7 @@ def insert_clickhouse(rows: list[dict], batch_size: int = 5000) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Seed PG + CH for aggregate compare")
     parser.add_argument("--rows", type=int, default=50_000, help="Rows per store")
+    parser.add_argument("--tenant-id", default="local")
     parser.add_argument("--machine-id", default="compare-bench")
     parser.add_argument("--metric-name", default="cpu_usage")
     parser.add_argument(
@@ -116,8 +119,12 @@ def main() -> None:
     if start.tzinfo is None:
         start = start.replace(tzinfo=timezone.utc)
 
-    print(f"Building {args.rows} rows for machine_id={args.machine_id!r} …")
+    print(
+        f"Building {args.rows} rows for tenant={args.tenant_id!r} "
+        f"machine_id={args.machine_id!r} …"
+    )
     rows = build_rows(
+        tenant_id=args.tenant_id,
         machine_id=args.machine_id,
         metric_name=args.metric_name,
         n=args.rows,
@@ -136,7 +143,8 @@ def main() -> None:
 
     print(
         "\nDone. Compare with:\n"
-        f'  curl "http://127.0.0.1:8001/metrics/aggregate/compare'
+        f'  curl -H "X-API-Key: dev-local-key" '
+        f'"http://127.0.0.1:8001/metrics/aggregate/compare'
         f"?machine_id={args.machine_id}&metric_name={args.metric_name}"
         f"&start_time={start.isoformat().replace('+', '%2B')}"
         f"&end_time={(end + timedelta(seconds=1)).isoformat().replace('+', '%2B')}"

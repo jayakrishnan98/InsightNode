@@ -1,9 +1,9 @@
 """
-InsightNode API — metrics, logs, traces, and multi-tenant identity (Phase 6 Day 1).
+InsightNode API — metrics, logs, traces, and multi-tenant isolation (Phase 6 Day 2).
 
-Architecture (Phase 6 Day 1):
-    Agents authenticate with X-API-Key → tenant_id stamped on ingest payloads.
-    Storage isolation / per-tenant limits / metering land on later Phase 6 days.
+Architecture (Phase 6 Day 2):
+    X-API-Key → tenant_id persisted in PG / ClickHouse / OpenSearch.
+    All query paths filter by the authenticated tenant.
 """
 
 from datetime import datetime
@@ -59,6 +59,7 @@ from backend.tenancy import (
     DEFAULT_TENANT_ID,
     TENANCY_STRICT,
     TenantContext,
+    ensure_metrics_tenant_isolation,
     ensure_tenants_schema_and_seed,
     list_tenants,
     require_tenant,
@@ -101,6 +102,7 @@ async def lifespan(app: FastAPI):
     logger.info("OpenSearch logs index ready")
 
     ensure_tenants_schema_and_seed()
+    ensure_metrics_tenant_isolation()
     logger.info("Tenants registry ready (default=%s strict=%s)", DEFAULT_TENANT_ID, TENANCY_STRICT)
 
     if setup_tracing():
@@ -147,7 +149,7 @@ async def lifespan(app: FastAPI):
     shutdown_tracing()
 
 
-app = FastAPI(title="InsightNode", version="0.10.0", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.10.1", lifespan=lifespan)
 
 # Phase 5 Day 2: instrument BEFORE the ASGI server starts (cannot add middleware later).
 if setup_tracing():
@@ -177,6 +179,7 @@ class MetricsPayload(BaseModel):
 
 class MetricPoint(BaseModel):
     """One stored metric row returned by GET /metrics (flattened from DB)."""
+    tenant_id: str | None = None
     machine_id: str
     metric_name: str
     value: float
@@ -264,6 +267,7 @@ class LogsIngestResponse(BaseModel):
 class LogSearchHit(BaseModel):
     """One hit from GET /logs/search."""
     event_id: str
+    tenant_id: str | None = None
     machine_id: str
     service: str
     level: str
@@ -390,6 +394,7 @@ def ingest_logs(
         attrs = dict(doc.get("attrs") or {})
         attrs["tenant_id"] = tenant.tenant_id
         doc["attrs"] = attrs
+        doc["tenant_id"] = tenant.tenant_id
         docs.append(doc)
     try:
         result = opensearch_index_logs(docs, refresh=True)
@@ -421,11 +426,13 @@ def search_logs(
     end_time: Optional[datetime] = Query(None, examples=["2026-07-24T00:00:00+00:00"]),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0, le=10_000),
+    tenant: TenantContext = Depends(require_tenant),
 ):
     """
     Search logs in OpenSearch (Phase 4 Day 3).
 
     Logic:
+        - Resolve tenant from X-API-Key; always filter by tenant_id (Phase 6 Day 2).
         - Optional full-text `q` on message (scored).
         - Optional exact filters: machine_id, service, level.
         - Optional time range on timestamp.
@@ -433,13 +440,14 @@ def search_logs(
 
     Reason:
         Finding "warn disk on host X" is the core log use case — not SQL LIKE.
-        Must register this route before /logs/{event_id} so "search" is not an id.
+        Tenant scoping prevents cross-customer leakage.
     """
     if start_time is not None and end_time is not None and start_time >= end_time:
         raise HTTPException(status_code=400, detail="start_time must be before end_time")
 
     try:
         result = opensearch_search_logs(
+            tenant_id=tenant.tenant_id,
             q=q,
             machine_id=machine_id,
             service=service,
@@ -461,14 +469,20 @@ def search_logs(
 
 
 @app.get("/logs/{event_id}")
-def get_log_by_event_id(event_id: str):
+def get_log_by_event_id(
+    event_id: str,
+    tenant: TenantContext = Depends(require_tenant),
+):
     """
     Fetch one log document by event_id (OpenSearch _id).
 
-    Day 2 verification helper — full-text search arrives in Day 3.
+    Returns 404 if missing or owned by another tenant (Phase 6 Day 2).
     """
     doc = opensearch_get_log(event_id)
     if doc is None:
+        raise HTTPException(status_code=404, detail="Log not found")
+    doc_tenant = doc.get("tenant_id") or (doc.get("attrs") or {}).get("tenant_id")
+    if doc_tenant and doc_tenant != tenant.tenant_id:
         raise HTTPException(status_code=404, detail="Log not found")
     return doc
 
@@ -485,22 +499,21 @@ def query_metrics(
     end_time: Optional[datetime] = Query(None, examples=["2026-06-14T20:00:00+00:00"]),
     limit: int = Query(100, ge=1, le=1000),
     db: Session = Depends(get_db),
+    tenant: TenantContext = Depends(require_tenant),
 ):
     """
     Query stored metrics from PostgreSQL with optional filters.
 
     Logic:
-        - Build a SELECT on MetricRecord.
+        - Always scope to the authenticated tenant (Phase 6 Day 2).
         - Apply optional filters: machine_id, metric_name, start_time, end_time.
-        - Order by timestamp ascending, cap rows with limit (default 100, max 1000).
-        - Map ORM rows to MetricPoint response objects.
+        - Order by timestamp ascending, cap rows with limit.
 
     Reason:
-        Dashboards and alerts need time-range scans, not full table dumps.
-        Filters match the composite index (machine_id, metric_name, timestamp).
-        limit prevents accidentally loading millions of raw points in one request.
+        Dashboards need time-range scans, not full table dumps.
+        Tenant filter is the isolation boundary between customers.
     """
-    stmt = select(MetricRecord)
+    stmt = select(MetricRecord).where(MetricRecord.tenant_id == tenant.tenant_id)
 
     if machine_id:
         stmt = stmt.where(MetricRecord.machine_id == machine_id)
@@ -517,6 +530,7 @@ def query_metrics(
 
     metrics = [
         MetricPoint(
+            tenant_id=row.tenant_id,
             machine_id=row.machine_id,
             metric_name=row.metric_name,
             value=row.value,
@@ -617,24 +631,25 @@ def query_metrics_aggregate(
     start_time: datetime = Query(..., examples=["2026-06-19T10:00:00+00:00"]),
     end_time: datetime = Query(..., examples=["2026-06-19T12:00:00+00:00"]),
     interval: Literal["1m", "5m", "15m", "1h", "3h", "6h", "12h", "24h", "1d"] = Query("5m"),
+    tenant: TenantContext = Depends(require_tenant),
 ):
     """
     Aggregate raw metrics into time buckets via ClickHouse (Phase 3 Day 3).
 
     Logic:
+        - Scope to authenticated tenant (Phase 6 Day 2).
         - Validate start < end.
         - Delegate to clickhouse_query_aggregate (toStartOfInterval + avg/min/max).
-        - Return the same MetricsAggregateResponse shape as Phase 1/2.
 
     Reason:
-        Dashboards need summarized series. Columnar storage is the right read path
-        for aggregates; raw GET /metrics stays on PostgreSQL.
+        Dashboards need summarized series. Tenant filter isolates customers.
     """
     if start_time >= end_time:
         raise HTTPException(status_code=400, detail="start_time must be before end_time")
 
     try:
         rows = clickhouse_query_aggregate(
+            tenant_id=tenant.tenant_id,
             machine_id=machine_id,
             metric_name=metric_name,
             start_time=start_time,
@@ -701,14 +716,15 @@ def compare_metrics_aggregate(
     runs: int = Query(3, ge=1, le=20),
     include_buckets: bool = Query(False),
     db: Session = Depends(get_db),
+    tenant: TenantContext = Depends(require_tenant),
 ):
     """
     Run the same aggregate on PostgreSQL and ClickHouse; report timings (Day 4).
 
     Logic:
+        - Scope both stores to authenticated tenant (Phase 6 Day 2).
         - Execute each store `runs` times; record min / median / max ms.
         - Compare bucket counts and sum(sample_count).
-        - Optionally return both bucket series for inspection.
 
     Reason:
         Feeling why columnar wins for analytics requires measuring the same
@@ -721,6 +737,7 @@ def compare_metrics_aggregate(
         pg_ms, pg_rows = _time_runs(
             lambda: postgres_query_aggregate(
                 db,
+                tenant_id=tenant.tenant_id,
                 machine_id=machine_id,
                 metric_name=metric_name,
                 start_time=start_time,
@@ -731,6 +748,7 @@ def compare_metrics_aggregate(
         )
         ch_ms, ch_rows = _time_runs(
             lambda: clickhouse_query_aggregate(
+                tenant_id=tenant.tenant_id,
                 machine_id=machine_id,
                 metric_name=metric_name,
                 start_time=start_time,

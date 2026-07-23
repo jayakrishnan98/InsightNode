@@ -7,6 +7,7 @@ Phase 4 Day 4: ships structured ops logs for DLQ / delivery failures.
 Phase 5 Day 3: extract W3C trace context from Kafka headers → continue traces.
 Phase 5 Day 4: manual dual-write spans (PG + ClickHouse) under kafka.consume.
 Phase 5 complete: see docs/phase-5-graduation.md.
+Phase 6 Day 2: persist tenant_id on dual-write (PG + ClickHouse).
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ from backend.kafka_client import (
 )
 from backend.models import MetricRecord
 from backend import logship as backend_logship
+from backend.tenancy import ensure_metrics_tenant_isolation
 from backend.tracing import (
     kafka_consume_span,
     manual_span,
@@ -66,8 +68,10 @@ def default_consumer_name() -> str:
 def _payload_to_rows(payload: dict) -> list[dict]:
     """Expand one agent payload into ORM row dicts (one per metric)."""
     event_id = payload.get("event_id")
+    tenant_id = str(payload.get("tenant_id") or "local")
     return [
         {
+            "tenant_id": tenant_id,
             "machine_id": payload["machine_id"],
             "metric_name": metric["name"],
             "value": metric["value"],
@@ -123,7 +127,7 @@ def _flush_batch(db: Session, batch: list[dict]) -> None:
         ) as pg_span:
             stmt = insert(MetricRecord).values(rows)
             stmt = stmt.on_conflict_do_nothing(
-                index_elements=["machine_id", "event_id", "metric_name"],
+                index_elements=["tenant_id", "machine_id", "event_id", "metric_name"],
                 index_where=text("event_id IS NOT NULL"),
             )
             result = db.execute(stmt)
@@ -261,6 +265,7 @@ def run_ingest_worker(
         5. Exit when stop_event set and idle.
     """
     name = consumer_name or default_consumer_name()
+    ensure_metrics_tenant_isolation()
     ensure_clickhouse_schema()
     consumer = get_consumer(group_id=CONSUMER_GROUP)
     producer = get_producer()

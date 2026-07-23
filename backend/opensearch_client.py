@@ -77,24 +77,28 @@ def ping() -> bool:
 
 def ensure_index() -> None:
     """
-    Idempotently create the insightnode-logs index from opensearch/logs_index.json.
+    Idempotently create insightnode-logs; ensure tenant_id mapping exists.
 
     Logic:
-        - If index exists → no-op.
-        - Else create with mappings (keyword filters + text message).
+        - If index missing → create from opensearch/logs_index.json.
+        - If present → put_mapping for tenant_id (Phase 6 Day 2).
 
     Reason:
         Docker does not auto-apply our mapping file. App-level ensure keeps
         local restarts reliable — same pattern as ClickHouse ensure_schema().
     """
     client = get_client()
-    if client.indices.exists(index=LOGS_INDEX):
-        logger.info("OpenSearch index already exists: %s", LOGS_INDEX)
+    if not client.indices.exists(index=LOGS_INDEX):
+        body = json.loads(INDEX_BODY_PATH.read_text(encoding="utf-8"))
+        client.indices.create(index=LOGS_INDEX, body=body)
+        logger.info("Created OpenSearch index: %s", LOGS_INDEX)
         return
 
-    body = json.loads(INDEX_BODY_PATH.read_text(encoding="utf-8"))
-    client.indices.create(index=LOGS_INDEX, body=body)
-    logger.info("Created OpenSearch index: %s", LOGS_INDEX)
+    client.indices.put_mapping(
+        index=LOGS_INDEX,
+        body={"properties": {"tenant_id": {"type": "keyword"}}},
+    )
+    logger.info("OpenSearch index ready: %s (tenant_id mapping ensured)", LOGS_INDEX)
 
 
 def _as_utc_iso(value: Any) -> str:
@@ -116,14 +120,21 @@ def _as_utc_iso(value: Any) -> str:
 def _normalize_doc(doc: dict[str, Any]) -> dict[str, Any]:
     """Map an API log event into an OpenSearch _source document."""
     event_id = str(doc["event_id"])
+    attrs = doc.get("attrs") or {}
+    tenant_id = str(
+        doc.get("tenant_id")
+        or attrs.get("tenant_id")
+        or "local"
+    )
     return {
         "event_id": event_id,
+        "tenant_id": tenant_id,
         "machine_id": doc["machine_id"],
         "service": doc.get("service") or "unknown",
         "level": doc.get("level") or "info",
         "message": doc["message"],
         "timestamp": _as_utc_iso(doc["timestamp"]),
-        "attrs": doc.get("attrs") or {},
+        "attrs": attrs,
     }
 
 
@@ -203,6 +214,7 @@ def get_log(event_id: str) -> dict[str, Any] | None:
 
 def search_logs(
     *,
+    tenant_id: str,
     q: str | None = None,
     machine_id: str | None = None,
     service: str | None = None,
@@ -216,17 +228,19 @@ def search_logs(
     Search insightnode-logs with full-text + structured filters (Phase 4 Day 3).
 
     Logic:
+        - Always filter by tenant_id (Phase 6 Day 2 isolation).
         - bool.query: must = match on message (if q); filter = exact + time range.
         - Filters use keyword fields (no scoring) — cheap and cacheable.
         - Sort timestamp desc; paginate with from/size.
 
     Reason:
         Dashboards need "find errors mentioning disk on host X last hour".
-        Separating text match (must) from exact filters matches how Datadog /
-        OpenSearch query DSL is typically used.
+        Tenant filter is mandatory so one org cannot see another's logs.
     """
     must: list[dict[str, Any]] = []
-    filters: list[dict[str, Any]] = []
+    filters: list[dict[str, Any]] = [
+        {"term": {"tenant_id": tenant_id}},
+    ]
 
     if q:
         must.append({"match": {"message": {"query": q, "operator": "and"}}})
@@ -246,18 +260,12 @@ def search_logs(
             time_range["lt"] = _as_utc_iso(end_time)
         filters.append({"range": {"timestamp": time_range}})
 
-    if not must and not filters:
-        # Empty search → recent logs (match_all)
-        query: dict[str, Any] = {"match_all": {}}
+    bool_body: dict[str, Any] = {"filter": filters}
+    if must:
+        bool_body["must"] = must
     else:
-        bool_body: dict[str, Any] = {}
-        if must:
-            bool_body["must"] = must
-        else:
-            bool_body["must"] = [{"match_all": {}}]
-        if filters:
-            bool_body["filter"] = filters
-        query = {"bool": bool_body}
+        bool_body["must"] = [{"match_all": {}}]
+    query = {"bool": bool_body}
 
     body = {
         "query": query,
@@ -280,6 +288,7 @@ def search_logs(
         logs.append(
             {
                 "event_id": source.get("event_id") or hit.get("_id"),
+                "tenant_id": source.get("tenant_id"),
                 "machine_id": source.get("machine_id"),
                 "service": source.get("service"),
                 "level": source.get("level"),
@@ -291,13 +300,18 @@ def search_logs(
         )
 
     logger.info(
-        "OpenSearch search q=%r filters=%s total=%s returned=%s",
+        "OpenSearch search tenant=%s q=%r filters=%s total=%s returned=%s",
+        tenant_id,
         q,
         {"machine_id": machine_id, "service": service, "level": level},
         total_count,
         len(logs),
     )
-    return {"total": total_count, "count": len(logs), "logs": logs}
+    return {
+        "total": total_count,
+        "count": len(logs),
+        "logs": logs,
+    }
 
 
 def close_client() -> None:

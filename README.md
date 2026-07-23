@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 6 Day 1 — tenant identity (`X-API-Key`)**  
-**Next: Phase 6 Day 2 — persist / query by `tenant_id`**
+**Current stage: Phase 6 Day 2 — tenant storage isolation**  
+**Next: Phase 6 Day 3 — per-tenant rate limits**
 
-Phase 6 Day 1 adds a `tenants` registry and resolves callers via `X-API-Key`, stamping `tenant_id` onto ingest payloads (storage isolation comes next).
+Phase 6 Day 2 persists `tenant_id` in PostgreSQL, ClickHouse, and OpenSearch, and scopes all query APIs to the authenticated tenant.
 
 ---
 
@@ -46,7 +46,7 @@ FastAPI (rate limit, HTTP spans) ──produce──► Kafka ──workers─�
 | **ClickHouse** | Columnar analytics store (Phase 3 complete) |
 | **OpenSearch** | Centralized logs — ingest, search, shipping (Phase 4 complete) |
 | **Jaeger / OTEL** | Linked ingest traces; dual-write + logship spans; log `attrs.trace_id` |
-| **Tenancy (Day 1)** | `tenants` table + `X-API-Key` → `tenant_id` on ingest |
+| **Tenancy (Day 2)** | `tenant_id` on PG/CH/OS; queries scoped by `X-API-Key` |
 
 ---
 
@@ -451,7 +451,7 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 | 3 | ClickHouse dual-write + analytics + PG vs CH compare |
 | 4 | OpenSearch logs — ingest, search, agent/API/worker shipping |
 | 5 | OpenTelemetry / Jaeger — distributed tracing + dual-write spans |
-| 6 | Multi-tenancy — Day 1 tenant registry + API-key identity (in progress) |
+| 6 | Multi-tenancy — Day 2 storage isolation (in progress) |
 
 ### Later phases
 

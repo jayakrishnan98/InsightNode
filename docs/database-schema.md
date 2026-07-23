@@ -9,6 +9,7 @@ InsightNode stores metrics in a single PostgreSQL table: `metrics`.
 ```sql
 CREATE TABLE IF NOT EXISTS metrics (
     id          BIGSERIAL PRIMARY KEY,
+    tenant_id   VARCHAR(64) NOT NULL DEFAULT 'local',
     machine_id  VARCHAR(255) NOT NULL,
     metric_name VARCHAR(255) NOT NULL,
     value       DOUBLE PRECISION NOT NULL,
@@ -28,6 +29,7 @@ Source of truth: [`sql/schema.sql`](../sql/schema.sql)
 | Column | Type | Description |
 |--------|------|-------------|
 | `id` | BIGSERIAL | Surrogate primary key; internal row identity |
+| `tenant_id` | VARCHAR(64) | Owning customer (Phase 6 Day 2; default `local`) |
 | `machine_id` | VARCHAR(255) | Source host (typically `socket.gethostname()`) |
 | `metric_name` | VARCHAR(255) | e.g. `cpu_usage`, `memory_usage`, `disk_usage` |
 | `value` | DOUBLE PRECISION | Observed gauge value |
@@ -51,8 +53,9 @@ A row with `created_at - timestamp > 30s` may indicate backlog or outage recover
 |-------|---------|---------|
 | `metrics_pkey` | `id` | Primary key |
 | `idx_metrics_timestamp` | `timestamp` | Broad time-range scans |
-| `idx_metrics_machine_metric_time` | `(machine_id, metric_name, timestamp)` | Main query pattern for GET /metrics and aggregate WHERE clause |
-| `idx_metrics_dedup` | `(machine_id, event_id, metric_name)` WHERE `event_id IS NOT NULL` | Idempotent inserts — prevents duplicate rows |
+| `idx_metrics_tenant_machine_metric_time` | `(tenant_id, machine_id, metric_name, timestamp)` | Tenant-scoped query / aggregate filters (Phase 6) |
+| `idx_metrics_machine_metric_time` | `(machine_id, metric_name, timestamp)` | Legacy host+metric+time pattern |
+| `idx_metrics_dedup` | `(tenant_id, machine_id, event_id, metric_name)` WHERE `event_id IS NOT NULL` | Per-tenant idempotent inserts |
 
 ---
 

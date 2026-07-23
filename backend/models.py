@@ -13,10 +13,11 @@ from backend.database import Base
 
 class MetricRecord(Base):
     """
-    One stored metric sample — one row per (machine, metric name, timestamp, value).
+    One stored metric sample — one row per (tenant, machine, metric, timestamp).
 
     Logic (schema):
         - id: surrogate primary key (BIGSERIAL) for efficient row identity.
+        - tenant_id: owning customer (Phase 6 Day 2 isolation).
         - machine_id + metric_name + timestamp: natural query dimensions.
         - value + unit: the observed gauge reading.
         - event_id: client-generated idempotency key (one per agent collection).
@@ -25,13 +26,13 @@ class MetricRecord(Base):
     Reason:
         Observability data is append-only: we insert new samples, rarely update.
         Separating timestamp (agent observation time) from created_at (ingest time)
-        helps debug clock skew and queue lag. event_id + idx_metrics_dedup prevent
-        duplicate rows when agents retry or replay spooled payloads. Indexes on
-        timestamp and (machine_id, metric_name, timestamp) support query APIs.
+        helps debug clock skew and queue lag. Dedup is per-tenant so two orgs
+        cannot collide on the same (machine, event_id, metric) triple.
     """
     __tablename__ = "metrics"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, default="local")
     machine_id: Mapped[str] = mapped_column(String(255), nullable=False)
     metric_name: Mapped[str] = mapped_column(String(255), nullable=False)
     value: Mapped[float] = mapped_column(Float, nullable=False)

@@ -30,6 +30,7 @@ METRICS_TABLE = f"{CLICKHOUSE_DATABASE}.metrics"
 SCHEMA_PATH = Path(__file__).resolve().parent.parent / "sql" / "clickhouse" / "schema.sql"
 
 COLUMN_NAMES = [
+    "tenant_id",
     "machine_id",
     "metric_name",
     "value",
@@ -117,15 +118,22 @@ def ensure_schema() -> None:
 
     Logic:
         - Run each statement from sql/clickhouse/schema.sql (IF NOT EXISTS).
+        - ADD COLUMN tenant_id for volumes created before Phase 6 Day 2.
         - Safe to call on every API / worker boot.
 
     Reason:
         Docker init scripts only run on an empty data volume. App-level ensure
-        keeps local restarts and fresh clones reliable.
+        keeps local restarts and fresh clones reliable. Existing MergeTree tables
+        keep their original ORDER BY until rebuilt; new installs lead with tenant_id.
     """
     client = get_client()
     for stmt in _statements_from_schema_file():
         client.command(stmt)
+    # Existing lab volumes: CREATE TABLE IF NOT EXISTS is a no-op — add column.
+    client.command(
+        f"ALTER TABLE {METRICS_TABLE} "
+        "ADD COLUMN IF NOT EXISTS tenant_id String DEFAULT 'local'"
+    )
     logger.info(
         "ClickHouse schema ready database=%s table=metrics",
         CLICKHOUSE_DATABASE,
@@ -173,6 +181,7 @@ def insert_metrics(rows: list[dict[str, Any]]) -> None:
 
     data = [
         [
+            str(row.get("tenant_id") or "local"),
             row["machine_id"],
             row["metric_name"],
             float(row["value"]),
@@ -193,6 +202,7 @@ def insert_metrics(rows: list[dict[str, Any]]) -> None:
 
 def query_aggregate(
     *,
+    tenant_id: str,
     machine_id: str,
     metric_name: str,
     start_time: datetime,
@@ -203,6 +213,7 @@ def query_aggregate(
     Time-bucket aggregation for GET /metrics/aggregate (Phase 3 Day 3).
 
     Logic:
+        - Filter by tenant_id first (Phase 6 Day 2 isolation).
         - Map interval key → allowlisted ClickHouse INTERVAL literal.
         - toStartOfInterval(timestamp, INTERVAL …) as bucket_start.
         - AVG / MIN / MAX / count() grouped by machine, metric, bucket.
@@ -211,6 +222,7 @@ def query_aggregate(
     Reason:
         Columnar scans make dashboard-style aggregates cheaper than PostgreSQL
         row scans at high volume. Same response shape as the old PG query.
+        Tenant filter prevents cross-customer data leaks.
     """
     ch_interval = CH_INTERVAL_MAP.get(interval)
     if ch_interval is None:
@@ -230,7 +242,8 @@ def query_aggregate(
             max(value) AS max,
             count() AS sample_count
         FROM {METRICS_TABLE}
-        WHERE machine_id = {{machine_id:String}}
+        WHERE tenant_id = {{tenant_id:String}}
+          AND machine_id = {{machine_id:String}}
           AND metric_name = {{metric_name:String}}
           AND timestamp >= {{start_time:DateTime64(3, 'UTC')}}
           AND timestamp < {{end_time:DateTime64(3, 'UTC')}}
@@ -241,6 +254,7 @@ def query_aggregate(
     result = get_client().query(
         sql,
         parameters={
+            "tenant_id": tenant_id,
             "machine_id": machine_id,
             "metric_name": metric_name,
             "start_time": start_utc,
@@ -266,7 +280,8 @@ def query_aggregate(
         )
 
     logger.info(
-        "ClickHouse aggregate machine=%s metric=%s interval=%s buckets=%s",
+        "ClickHouse aggregate tenant=%s machine=%s metric=%s interval=%s buckets=%s",
+        tenant_id,
         machine_id,
         metric_name,
         interval,

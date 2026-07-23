@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from fastapi import Header, HTTPException
-from sqlalchemy import Boolean, DateTime, String, Text, func, select
+from sqlalchemy import Boolean, DateTime, String, Text, func, select, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base, SessionLocal, engine
@@ -109,6 +109,48 @@ def ensure_tenants_schema_and_seed() -> None:
             logger.info("Default tenant ready id=%s", DEFAULT_TENANT_ID)
     finally:
         db.close()
+
+
+def ensure_metrics_tenant_isolation() -> None:
+    """
+    Add tenant_id to existing PostgreSQL metrics + rebuild dedup index (Phase 6 Day 2).
+
+    Logic:
+        - ALTER ADD COLUMN IF NOT EXISTS (DEFAULT local for pre-tenant rows).
+        - Drop legacy dedup index; create per-tenant unique index.
+        - Ensure tenant-leading query index exists.
+
+    Reason:
+        Fresh installs get tenant_id from sql/schema.sql. Existing lab DBs need
+        an idempotent migration on API/worker boot.
+    """
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE metrics "
+                "ADD COLUMN IF NOT EXISTS tenant_id VARCHAR(64) NOT NULL DEFAULT 'local'"
+            )
+        )
+        # Replace pre-Phase-6 dedup (machine, event, metric) with tenant-scoped.
+        conn.execute(text("DROP INDEX IF EXISTS idx_metrics_dedup"))
+        conn.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_metrics_dedup
+                ON metrics (tenant_id, machine_id, event_id, metric_name)
+                WHERE event_id IS NOT NULL
+                """
+            )
+        )
+        conn.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS idx_metrics_tenant_machine_metric_time
+                ON metrics (tenant_id, machine_id, metric_name, timestamp)
+                """
+            )
+        )
+    logger.info("PostgreSQL metrics tenant isolation ready")
 
 
 def resolve_tenant_by_api_key(db, api_key: str | None) -> TenantContext:

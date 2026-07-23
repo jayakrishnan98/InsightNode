@@ -3,11 +3,7 @@ Background worker — drains Kafka ingest topic and dual-writes storage.
 
 Phase 2: Kafka consumer group, ACK-after-commit, DLQ for poison messages.
 Phase 3 Day 2: each successful batch also inserts into ClickHouse.
-
-Commit order (learning rule):
-  1. PostgreSQL (idempotent via event_id unique index)
-  2. ClickHouse (append-only; may duplicate on rare redelivery)
-  3. Kafka offset commit only after both writes succeed
+Phase 4 Day 4: ships structured ops logs for DLQ / delivery failures.
 """
 
 from __future__ import annotations
@@ -40,6 +36,7 @@ from backend.kafka_client import (
     publish_dlq,
 )
 from backend.models import MetricRecord
+from backend import logship as backend_logship
 
 logger = logging.getLogger(__name__)
 
@@ -174,12 +171,27 @@ def _handle_failed_messages(
                     event_id,
                     deliveries,
                 )
+                backend_logship.error(
+                    "worker",
+                    "Moved poison metrics message to DLQ",
+                    event_id=event_id,
+                    deliveries=deliveries,
+                    max_deliveries=MAX_DELIVERIES,
+                    reason=reason,
+                )
             else:
                 logger.warning(
                     "Leaving message event_id=%s uncommitted (deliveries=%s/%s)",
                     event_id,
                     deliveries,
                     MAX_DELIVERIES,
+                )
+                backend_logship.warn(
+                    "worker",
+                    "Leaving metrics message uncommitted for retry",
+                    event_id=event_id,
+                    deliveries=deliveries,
+                    max_deliveries=MAX_DELIVERIES,
                 )
         finally:
             db.close()

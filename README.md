@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 4 Day 3 — log search**  
-**Next: Phase 4 Day 4 — agent / API structured log shipping**
+**Current stage: Phase 4 Day 4 — structured log shipping**  
+**Next: Phase 4 Day 5 — docs + graduation**
 
-Phase 4 Day 3 adds `GET /logs/search` (full-text on `message` + keyword/time filters). Ingest remains `POST /logs`.
+Phase 4 Day 4: the agent ships lifecycle/threshold logs via `POST /logs`; API and workers ship ops events (rate limit, lag, DLQ) into OpenSearch. Search with `GET /logs/search`.
 
 ---
 
@@ -43,7 +43,7 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
 | **Ops** | `/health` (Kafka + ClickHouse), `/pipeline` (partition lag), `/dlq` |
 | **Agent resilience** | Retries + on-disk spool |
 | **ClickHouse** | Columnar analytics store (Phase 3 complete) |
-| **OpenSearch (Day 3)** | Ingest + full-text search with filters |
+| **OpenSearch (Day 4)** | Ingest + search + agent/API/worker log shipping |
 
 ---
 
@@ -54,6 +54,7 @@ InsightNode/
 ├── agent/
 │   ├── main.py
 │   ├── spool.py
+│   ├── logship.py           # Phase 4 Day 4 — POST /logs from agent
 │   └── data/
 ├── backend/
 │   ├── main.py              # FastAPI — ingest, query, pipeline, dlq
@@ -61,6 +62,7 @@ InsightNode/
 │   ├── kafka_client.py      # Phase 2 Day 5–6 Kafka helpers
 │   ├── clickhouse_client.py # Phase 3 — connect, insert, aggregate
 │   ├── opensearch_client.py # Phase 4 — index, get, search
+│   ├── logship.py           # Phase 4 Day 4 — API/worker → OpenSearch
 │   ├── postgres_aggregate.py# Phase 3 Day 4 — PG aggregate for compare
 │   ├── rate_limit.py        # Phase 2 Day 6 ingest rate limit
 │   ├── redis_client.py      # Phase 2 Days 1–4 (history)
@@ -206,7 +208,7 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
-> See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) for OpenSearch (Days 1–3).
+> See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) for OpenSearch (Days 1–4).
 > See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) and [docs/phase-3-graduation.md](docs/phase-3-graduation.md).
 > See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).
 > Redis Streams code (`backend/redis_client.py`) remains as Days 1–4 learning history.
@@ -326,6 +328,15 @@ curl http://127.0.0.1:8001/logs/550e8400-e29b-41d4-a716-446655440000
 
 ```bash
 curl "http://127.0.0.1:8001/logs/search?q=disk&level=warn&limit=10"
+```
+
+Agent threshold logs (Day 4) — lower thresholds to force a warn:
+
+```bash
+cd agent
+DISK_WARN_PERCENT=1 python main.py
+# then:
+curl "http://127.0.0.1:8001/logs/search?service=agent&level=warn"
 ```
 
 ### `GET /health` — Pipeline health

@@ -6,115 +6,94 @@ Phase 4 adds centralized **log search**. Metrics stay on the Phase 2–3 path (K
 Phase 3:  metrics → Kafka → PG + ClickHouse; aggregate on CH
 Day 1:    + OpenSearch up (index + health)
 Day 2:    POST /logs → OpenSearch
-Day 3:    GET /logs/search full-text + filters         ← YOU ARE HERE
-Day 4:    Agent / API structured log shipping
+Day 3:    GET /logs/search full-text + filters
+Day 4:    Agent / API structured log shipping          ← YOU ARE HERE
 Day 5:    Docs + graduation
 ```
 
 ---
 
-## Current architecture (Day 3)
+## Current architecture (Day 4)
 
 ```mermaid
 flowchart LR
-  AgentMetrics -->|POST /metrics| API[FastAPI]
+  Agent -->|POST /metrics| API[FastAPI]
+  Agent -->|POST /logs| API
   API --> K[(Kafka)]
   K --> W[workers]
   W --> PG[(PostgreSQL)]
   W --> CH[(ClickHouse)]
-  Client -->|POST /logs| API
-  API -->|bulk index| OS[(OpenSearch)]
+  API -->|index_logs| OS[(OpenSearch)]
+  W -->|logship| OS
   Client -->|GET /logs/search| OS
-  Client -->|GET /logs/event_id| OS
 ```
 
-| Signal | Path | Why |
-|--------|------|-----|
-| Metrics | Kafka → PG + CH | Numbers / aggregates |
-| Logs | OpenSearch | Full-text + keyword filters |
+| Producer | How logs are shipped | `service` field |
+|----------|----------------------|-----------------|
+| Agent | HTTP `POST /logs` via `agent/logship.py` | `agent` |
+| API | In-process `backend/logship.py` → OpenSearch | `api` |
+| Worker | In-process `backend/logship.py` → OpenSearch | `worker` |
+
+Log shipping is **best-effort**: failures never break metric ingest or spooling.
 
 ---
 
-## Day 3 lesson — search vs get-by-id
+## Day 4 lesson — ship events, not stdout
 
-| API | What it does |
-|-----|----------------|
-| `GET /logs/{event_id}` | Direct document lookup by `_id` (Day 2) |
-| `GET /logs/search` | Query DSL: text match + filters + time range |
+| Before | After |
+|--------|-------|
+| `print("[RETRY] …")` only on console | Also a structured OpenSearch document |
+| Guess which host failed | Filter `service=agent` + `machine_id=…` |
+| Metrics show high disk | Logs explain "Disk usage high: 92%" with attrs |
 
-OpenSearch `bool` query shape we use:
+What the agent ships:
 
-```
-must:   match message   ← scored full-text (optional)
-filter: term / range    ← exact level, host, service, time (not scored)
-```
+- Startup `info`
+- Retry / send failure `warn` / `error`
+- Spool replay / pending `info` / `warn`
+- Threshold crossings (`cpu` / `memory` / `disk`) as `warn`
 
-| Concept | Why it matters |
-|---------|----------------|
-| `text` (`message`) | Analyzed tokens — "disk usage" finds that phrase |
-| `keyword` (`level`, …) | Exact equality — `level=error` |
-| `filter` context | Faster, cacheable; does not affect `_score` |
-| `must` / `match` | Relevance ranking when you pass `q` |
+What API / worker ship:
 
-Route order matters: `/logs/search` is registered **before** `/logs/{event_id}` so FastAPI does not treat `"search"` as an event id.
+- Rate limit exceeded (`api` / `warn`)
+- Kafka lag backpressure (`api` / `warn`)
+- Uncommitted retry / DLQ poison (`worker` / `warn` / `error`)
 
 ---
 
-## APIs
-
-### `POST /logs` (Day 2)
-
-Bulk index; `event_id` = document `_id`.
-
-### `GET /logs/search` (Day 3)
-
-| Param | Type | Description |
-|-------|------|-------------|
-| `q` | string | Full-text on `message` (AND) |
-| `machine_id` | string | Exact host |
-| `service` | string | Exact service |
-| `level` | string | `debug` / `info` / `warn` / `error` |
-| `start_time` / `end_time` | ISO 8601 | Time range (`end` exclusive) |
-| `limit` / `offset` | int | Pagination (newest first) |
+## Search examples
 
 ```bash
-curl "http://127.0.0.1:8001/logs/search?q=disk&level=warn&limit=10"
+# Agent threshold warnings
+curl "http://127.0.0.1:8001/logs/search?service=agent&level=warn&q=Disk"
+
+# API rate limits
+curl "http://127.0.0.1:8001/logs/search?service=api&q=rate"
+
+# Worker DLQ events
+curl "http://127.0.0.1:8001/logs/search?service=worker&level=error"
 ```
 
-### `GET /logs/{event_id}` (Day 2)
-
-Fetch one document by id.
-
----
-
-## Index: `insightnode-logs`
-
-Source: [`opensearch/logs_index.json`](../opensearch/logs_index.json)
-
-| Field | Type | Role in Day 3 |
-|-------|------|----------------|
-| `message` | `text` | `q` full-text |
-| `machine_id` / `service` / `level` | `keyword` | Exact filters |
-| `timestamp` | `date` | Range filter + sort |
-
----
-
-## Local ops
+Lower agent thresholds for a demo:
 
 ```bash
-docker compose up -d
-uvicorn backend.main:app --reload --port 8001
-
-# Index a sample, then search
-curl -s -X POST http://127.0.0.1:8001/logs -H 'Content-Type: application/json' -d '{...}'
-curl "http://127.0.0.1:8001/logs/search?q=disk&level=warn"
+DISK_WARN_PERCENT=1 CPU_WARN_PERCENT=1 MEMORY_WARN_PERCENT=1 python main.py
 ```
 
 ---
 
-## What Day 3 deliberately does not include
+## APIs (Days 2–3, still in force)
 
-- Agent auto log shipping → **Day 4**
-- Kafka topic for logs → later / optional
-- Aggregations / log patterns / alerting → later
-- OpenSearch Dashboards UI → optional later
+| Endpoint | Role |
+|----------|------|
+| `POST /logs` | Bulk index (agent uses this) |
+| `GET /logs/search` | Full-text + filters |
+| `GET /logs/{event_id}` | Direct get by id |
+
+---
+
+## What Day 4 deliberately does not include
+
+- Shipping every Python `logger.info` line (too noisy)
+- Kafka topic for logs (direct / in-process is enough for learning)
+- Formal graduation → **Day 5**

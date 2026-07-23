@@ -1,10 +1,9 @@
 """
 InsightNode API — metrics + Phase 4 logs.
 
-Architecture (Phase 4 Day 3):
-    Metrics: Kafka → workers → PostgreSQL + ClickHouse (unchanged).
-    Logs:    POST /logs → OpenSearch; GET /logs/search (full-text + filters);
-             GET /logs/{event_id} by id.
+Architecture (Phase 4 Day 4):
+    Metrics: Kafka → workers → PostgreSQL + ClickHouse.
+    Logs:    POST /logs + GET /logs/search; agent/API ship structured ops logs.
 """
 
 from datetime import datetime
@@ -55,6 +54,7 @@ from backend.rate_limit import (
     RATE_LIMIT_WINDOW_SECONDS,
     ingest_rate_limiter,
 )
+from backend import logship as backend_logship
 
 logger = logging.getLogger(__name__)
 kafka_producer = None  # set in lifespan
@@ -125,7 +125,7 @@ async def lifespan(app: FastAPI):
     close_opensearch()
 
 
-app = FastAPI(title="InsightNode", version="0.6.2", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.6.3", lifespan=lifespan)
 
 class Metric(BaseModel):
     """Single metric reading inside an ingestion payload (name, value, unit)."""
@@ -503,6 +503,13 @@ def ingest_metrics(payload: MetricsPayload):
 
     if not ingest_rate_limiter.allow(payload.machine_id):
         logger.warning("Rate limit exceeded machine=%s", payload.machine_id)
+        backend_logship.warn(
+            "api",
+            "Ingest rate limit exceeded",
+            machine_id=payload.machine_id,
+            rate_limit_max=RATE_LIMIT_MAX,
+            window_seconds=RATE_LIMIT_WINDOW_SECONDS,
+        )
         raise HTTPException(
             status_code=429,
             detail=(
@@ -517,6 +524,13 @@ def ingest_metrics(payload: MetricsPayload):
         enqueue_payload(kafka_producer, item)
     except QueueFullError:
         logger.warning("Kafka ingest lag too high — rejecting payload")
+        backend_logship.warn(
+            "api",
+            "Kafka ingest lag too high — rejecting payload",
+            machine_id=payload.machine_id,
+            event_id=payload.event_id,
+            queue_maxsize=QUEUE_MAX_LENGTH,
+        )
         raise HTTPException(
             status_code=503,
             detail="Ingest queue full, try again later",

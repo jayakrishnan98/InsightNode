@@ -165,7 +165,7 @@ See [phase-4-graduation.md](phase-4-graduation.md).
 
 See [phase-5-graduation.md](phase-5-graduation.md).
 
-### Phase 6 — Production SaaS concerns
+### Phase 6 — Production SaaS concerns ✅
 
 - **Day 1:** Tenant registry + `X-API-Key` identity (stamp `tenant_id` on ingest)
 - **Day 2:** Persist / query by `tenant_id` (storage isolation)
@@ -174,3 +174,19 @@ See [phase-5-graduation.md](phase-5-graduation.md).
 - **Day 5:** Sharding concepts + docs + graduation
 
 See [phase-6-architecture.md](phase-6-architecture.md) and [phase-6-graduation.md](phase-6-graduation.md).
+
+### Phase 7 — Visualization & product UI ✅
+
+- **Day 1:** Grafana + provisioned datasources
+- **Day 2:** Infrastructure Monitoring dashboard
+- **Day 3:** Prometheus + Platform dashboard
+- **Day 4:** Grafana alerting → `alert_events`
+- **Day 5:** Hosts / system summary APIs
+- **Day 6:** Thin Next.js UI
+- **Day 7:** Fleet simulator + docs + graduation
+
+See [phase-7-architecture.md](phase-7-architecture.md) and [phase-7-graduation.md](phase-7-graduation.md).
+
+### Later
+
+- Retention policies, percentiles, multi-cell routing, managed cloud DBs, custom alert-rule evaluator

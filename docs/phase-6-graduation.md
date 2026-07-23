@@ -1,7 +1,7 @@
 # Phase 6 Graduation Checklist
 
 **Completed:** Phase 6 Day 5  
-**Next:** Open-ended — deepen any pillar, or experiment with real multi-cell sharding
+**Next:** Phase 7 — visualization (Grafana, Prometheus, thin UI, alerting). See [phase-7-graduation.md](phase-7-graduation.md).
 
 ---
 

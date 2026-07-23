@@ -3,21 +3,24 @@ OpenTelemetry tracing for Phase 5.
 
 Day 1: TracerProvider + OTLP HTTP exporter → Jaeger; health ping.
 Day 2: FastAPI HTTP auto-instrumentation (one span per request).
-Day 3+: Kafka context propagation / manual spans (not yet).
+Day 3: W3C context propagation — HTTP (agent→API) + Kafka headers (API→worker).
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from typing import TYPE_CHECKING
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Iterator
 
 import httpx
-from opentelemetry import trace
+from opentelemetry import context as otel_context
+from opentelemetry import propagate, trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.trace import SpanKind, Status, StatusCode
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -85,7 +88,7 @@ def setup_tracing(service_name: str | None = None) -> bool:
     tracer = trace.get_tracer("insightnode.tracing")
     with tracer.start_as_current_span("startup.bootstrap") as span:
         span.set_attribute("insightnode.phase", "5")
-        span.set_attribute("insightnode.day", "2")
+        span.set_attribute("insightnode.day", "3")
 
     logger.info(
         "OpenTelemetry tracing ready service=%s otlp=%s",
@@ -103,6 +106,7 @@ def instrument_fastapi(app: "FastAPI") -> bool:
         - Requires setup_tracing() first (shared TracerProvider).
         - FastAPIInstrumentor creates spans named like GET /metrics.
         - Excludes health/docs by default to keep the UI readable.
+        - Also extracts inbound W3C `traceparent` (agent → API on Day 3).
 
     Reason:
         Auto-instrumentation teaches the request→span model before we add
@@ -139,6 +143,110 @@ def get_tracer(name: str = "insightnode") -> trace.Tracer:
     return trace.get_tracer(name)
 
 
+def inject_trace_headers() -> dict[str, str]:
+    """
+    Snapshot the current span context into W3C carrier headers (Phase 5 Day 3).
+
+    Logic:
+        - propagate.inject writes `traceparent` (+ optional `tracestate`).
+        - Call while the span you want to continue is current.
+
+    Reason:
+        Same carrier format for HTTP (agent→API) and Kafka message headers.
+    """
+    carrier: dict[str, str] = {}
+    propagate.inject(carrier)
+    return carrier
+
+
+def kafka_headers_from_context() -> list[tuple[str, bytes]]:
+    """W3C headers as kafka-python expects: list of (key, bytes)."""
+    return [(k, v.encode("utf-8")) for k, v in inject_trace_headers().items()]
+
+
+def context_from_kafka_headers(headers: Any) -> otel_context.Context:
+    """
+    Rebuild an OpenTelemetry context from Kafka record headers.
+
+    Logic:
+        - kafka-python gives [(key, value_bytes), ...].
+        - Decode to a text carrier and propagate.extract.
+        - Missing/invalid headers → current (usually root) context.
+    """
+    carrier: dict[str, str] = {}
+    if headers:
+        for key, value in headers:
+            if value is None:
+                continue
+            if isinstance(value, bytes):
+                carrier[str(key)] = value.decode("utf-8")
+            else:
+                carrier[str(key)] = str(value)
+    return propagate.extract(carrier)
+
+
+@contextmanager
+def kafka_produce_span(destination: str) -> Iterator[trace.Span]:
+    """
+    PRODUCER span around a Kafka send; inject after enter so headers nest under it.
+
+    Usage:
+        with kafka_produce_span(topic) as span:
+            headers = kafka_headers_from_context()
+            producer.send(..., headers=headers)
+    """
+    tracer = get_tracer("insightnode.kafka")
+    with tracer.start_as_current_span(
+        "kafka.produce",
+        kind=SpanKind.PRODUCER,
+    ) as span:
+        span.set_attribute("messaging.system", "kafka")
+        span.set_attribute("messaging.destination.name", destination)
+        span.set_attribute("messaging.operation", "publish")
+        yield span
+
+
+@contextmanager
+def kafka_consume_span(
+    headers: Any,
+    *,
+    destination: str,
+    event_id: str | None = None,
+    offset: int | None = None,
+    partition: int | None = None,
+) -> Iterator[trace.Span]:
+    """
+    CONSUMER span parented by the producer context extracted from Kafka headers.
+
+    Logic:
+        - extract(headers) → remote parent (API kafka.produce / HTTP request).
+        - start_as_current_span(..., context=extracted) continues the same trace_id.
+    """
+    parent = context_from_kafka_headers(headers)
+    tracer = get_tracer("insightnode.kafka")
+    with tracer.start_as_current_span(
+        "kafka.consume",
+        context=parent,
+        kind=SpanKind.CONSUMER,
+    ) as span:
+        span.set_attribute("messaging.system", "kafka")
+        span.set_attribute("messaging.destination.name", destination)
+        span.set_attribute("messaging.operation", "receive")
+        if event_id:
+            span.set_attribute("insightnode.event_id", event_id)
+        if offset is not None:
+            span.set_attribute("messaging.kafka.offset", offset)
+        if partition is not None:
+            span.set_attribute("messaging.kafka.partition", partition)
+        yield span
+
+
+def record_span_error(span: trace.Span, exc: BaseException) -> None:
+    """Mark a span failed (worker / produce errors)."""
+    span.record_exception(exc)
+    span.set_status(Status(StatusCode.ERROR, str(exc)))
+
+
 def ping() -> bool:
     """True if Jaeger admin or UI answers (collector is up)."""
     for url in (JAEGER_ADMIN_URL, JAEGER_UI_URL):
@@ -153,7 +261,7 @@ def ping() -> bool:
 
 
 def shutdown_tracing() -> None:
-    """Flush and shut down the TracerProvider (API lifespan)."""
+    """Flush and shut down the TracerProvider (API lifespan / worker exit)."""
     global _provider, _fastapi_instrumented
     if _provider is None:
         return

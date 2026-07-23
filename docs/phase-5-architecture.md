@@ -1,53 +1,64 @@
 # Phase 5 Architecture — OpenTelemetry + Jaeger (traces)
 
-Phase 5 adds **distributed tracing**: follow one request/work unit across API → Kafka → worker (and later the agent). Metrics answer “how much?”, logs answer “what happened?”, traces answer “where did time go across services?”
+Phase 5 adds **distributed tracing**: follow one request/work unit across API → Kafka → worker (and the agent). Metrics answer “how much?”, logs answer “what happened?”, traces answer “where did time go across services?”
 
 ```
 Phase 4:  logs → OpenSearch
 Day 1:    + Jaeger up (OTLP + UI) + TracerProvider bootstrap
-Day 2:    Instrument FastAPI HTTP requests (auto spans)   ← YOU ARE HERE
-Day 3:    Propagate context across Kafka (agent → API → worker)
+Day 2:    Instrument FastAPI HTTP requests (auto spans)
+Day 3:    Propagate context across Kafka (agent → API → worker)  ← YOU ARE HERE
 Day 4:    Manual spans for dual-write / logship + event_id attrs
 Day 5:    Docs + graduation
 ```
 
 ---
 
-## Current architecture (Day 2)
+## Current architecture (Day 3)
 
 ```mermaid
 flowchart LR
-  Client -->|HTTP| API[FastAPI]
-  API -->|server span per request| API
-  API -->|OTLP :4318| Jaeger[(Jaeger)]
+  Agent -->|traceparent HTTP| API[FastAPI]
+  API -->|traceparent Kafka headers| Worker
+  Agent -->|OTLP| Jaeger[(Jaeger)]
+  API -->|OTLP| Jaeger
+  Worker -->|OTLP| Jaeger
   Jaeger -->|UI :16686| Browser
 ```
 
-| Concept | Day 2 meaning |
-|---------|----------------|
-| Server span | One span wrapping an inbound HTTP request |
-| Span name | e.g. `GET /logs/search`, `POST /metrics` |
-| Attributes | `http.method`, `http.route`, status code, … |
-| Excluded | `/health`, `/docs`, OpenAPI (less UI noise) |
+| Hop | Mechanism | Span |
+|-----|-----------|------|
+| Agent → API | W3C `traceparent` HTTP header | `agent.push_metrics` (CLIENT) → `POST /metrics` (SERVER) |
+| API → Worker | Same headers on Kafka record | `kafka.produce` (PRODUCER) → `kafka.consume` (CONSUMER) |
 
-Each request is still a **single-service** trace. Cross-process linking (Kafka) is Day 3.
+Same `trace_id` across all three services. Jaeger UI → any service → Find Traces shows the full chain.
 
 ---
 
-## Day 2 lesson — auto-instrumentation
+## Day 3 lesson — context propagation
 
 ```
-setup_tracing()           # TracerProvider + OTLP exporter
-instrument_fastapi(app)   # ASGI middleware creates spans
+inject(carrier)   # write traceparent from current span
+extract(carrier)  # rebuild parent context in another process
 ```
 
-| Approach | When |
-|----------|------|
-| Auto (Day 2) | HTTP edge — every route for free |
-| Manual (Day 4) | Dual-write, logship, custom steps |
-| Propagation (Day 3) | Same `trace_id` across API → worker |
+| Carrier | Where |
+|---------|--------|
+| HTTP headers | Agent `httpx.post(..., headers=inject())` |
+| Kafka headers | `producer.send(..., headers=[(k, bytes)])` |
 
-Excluded URLs (env `OTEL_EXCLUDED_URLS`): `health,docs,openapi.json,redoc,favicon.ico`
+Without inject/extract, each process starts a **new** root span — you cannot stitch agent → API → worker into one waterfall.
+
+---
+
+## Services in Jaeger
+
+| `service.name` | Process |
+|----------------|---------|
+| `insightnode-agent` | `python agent/main.py` |
+| `insightnode-api` | `uvicorn backend.main:app` |
+| `insightnode-worker` | `python -m backend.worker` |
+
+Embedded worker (`EMBEDDED_WORKER=1`) shares the API process → spans appear under `insightnode-api`.
 
 ---
 
@@ -56,13 +67,17 @@ Excluded URLs (env `OTEL_EXCLUDED_URLS`): `health,docs,openapi.json,redoc,favico
 ```bash
 docker compose up -d
 uvicorn backend.main:app --reload --port 8001
+python -m backend.worker
+# optional: python agent/main.py
 
-# Generate spans (not /health — excluded)
-curl "http://127.0.0.1:8001/pipeline"
-curl "http://127.0.0.1:8001/logs/search?limit=5"
+# Or curl with a synthetic parent (still exercises API → Kafka → worker):
+curl -X POST "http://127.0.0.1:8001/metrics" \
+  -H "Content-Type: application/json" \
+  -d '{"machine_id":"demo","timestamp":"2026-07-22T12:00:00Z","metrics":[{"name":"cpu_usage","value":1,"unit":"%"}],"event_id":"day3-demo"}'
 
-# Jaeger UI → Service insightnode-api → Find Traces
 open http://localhost:16686
+# Service: insightnode-api or insightnode-worker → Find Traces
+# Expect: POST /metrics → kafka.produce → kafka.consume (same trace)
 ```
 
 ---
@@ -77,8 +92,8 @@ open http://localhost:16686
 
 ---
 
-## What Day 2 deliberately does not include
+## What Day 3 deliberately does not include
 
-- Trace context in Kafka headers / agent → **Day 3**
-- Manual spans around dual-write → **Day 4**
-- Client instrumentation of `httpx` in the agent → Day 3/4
+- Manual spans around dual-write / logship internals → **Day 4**
+- Sampling strategies / tail-based sampling → later
+- Trace↔log correlation fields in OpenSearch → Day 4/5

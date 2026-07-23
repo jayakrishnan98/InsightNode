@@ -6,6 +6,7 @@ are buffered to disk (see spool.py) and replayed when connectivity returns.
 
 Phase 4 Day 4: also ships structured logs to POST /logs (see logship.py) for
 retries, spool events, and threshold warnings — searchable in OpenSearch.
+Phase 5 Day 3: injects W3C trace context on POST /metrics (see tracing.py).
 """
 
 import os
@@ -18,6 +19,7 @@ import uuid
 
 import spool
 import logship
+import tracing as agent_tracing
 
 MACHINE_ID = socket.gethostname()
 COLLECTION_INTERVAL_SECONDS = int(os.getenv("COLLECTION_INTERVAL_SECONDS", "5"))
@@ -143,8 +145,22 @@ def send_metrics_with_retry(payload: dict) -> bool:
     """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = httpx.post(API_URL, json=payload, timeout=10.0)
-            response.raise_for_status()
+            with agent_tracing.push_metrics_span(
+                event_id=str(payload.get("event_id") or "") or None
+            ) as span:
+                try:
+                    headers = agent_tracing.inject_headers()
+                    response = httpx.post(
+                        API_URL,
+                        json=payload,
+                        headers=headers,
+                        timeout=10.0,
+                    )
+                    response.raise_for_status()
+                    span.set_attribute("http.status_code", response.status_code)
+                except Exception as exc:
+                    agent_tracing.record_error(span, exc)
+                    raise
             print(f"[SENT] {response.status_code} → {response.json()}")
             return True
         except httpx.HTTPError as e:
@@ -234,22 +250,26 @@ def main() -> None:
         searchable in OpenSearch alongside metrics charts.
     """
     logship.info("Agent starting", metrics_url=API_URL)
-    while True:
-        replay_spool()
+    agent_tracing.setup_tracing()
+    try:
+        while True:
+            replay_spool()
 
-        payload = collect_metrics()
-        emit_threshold_logs(payload)
+            payload = collect_metrics()
+            emit_threshold_logs(payload)
 
-        if send_metrics_with_retry(payload):
-            pass  # success
-        else:
-            spool.append(payload)
-            print(f"[SPOOL] Buffered payload on disk (total={spool.size()})")
-            logship.warn(
-                "Buffered metrics payload to disk spool",
-                spool_size=spool.size(),
-                metrics_event_id=payload.get("event_id"),
-            )
+            if send_metrics_with_retry(payload):
+                pass  # success
+            else:
+                spool.append(payload)
+                print(f"[SPOOL] Buffered payload on disk (total={spool.size()})")
+                logship.warn(
+                    "Buffered metrics payload to disk spool",
+                    spool_size=spool.size(),
+                    metrics_event_id=payload.get("event_id"),
+                )
+    finally:
+        agent_tracing.shutdown_tracing()
 
 
 if __name__ == "__main__":

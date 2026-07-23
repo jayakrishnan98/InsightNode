@@ -128,11 +128,16 @@ def enqueue_payload(producer: KafkaProducer, payload: dict[str, Any]) -> None:
 
     Logic:
         - Soft backpressure: if consumer lag estimate >= max → QueueFullError.
-        - produce(key=machine_id, value=payload) and flush.
+        - Start a PRODUCER span, inject W3C trace context into Kafka headers,
+          then produce(key=machine_id, value=payload, headers=...) and flush.
 
     Reason:
         Agents get 503 when workers fall far behind — same idea as Redis XLEN cap.
+        Headers carry the active HTTP/request span so the worker continues the
+        same trace_id (Phase 5 Day 3).
     """
+    from backend.tracing import kafka_headers_from_context, kafka_produce_span
+
     lag = approximate_lag()
     if lag >= QUEUE_MAX_LENGTH:
         raise QueueFullError(
@@ -140,8 +145,18 @@ def enqueue_payload(producer: KafkaProducer, payload: dict[str, Any]) -> None:
         )
 
     key = payload.get("machine_id")
-    future = producer.send(INGEST_TOPIC, key=key, value=payload)
-    future.get(timeout=10)
+    with kafka_produce_span(INGEST_TOPIC) as span:
+        event_id = payload.get("event_id")
+        if event_id:
+            span.set_attribute("insightnode.event_id", str(event_id))
+        headers = kafka_headers_from_context()
+        future = producer.send(
+            INGEST_TOPIC,
+            key=key,
+            value=payload,
+            headers=headers,
+        )
+        future.get(timeout=10)
 
 
 def publish_dlq(

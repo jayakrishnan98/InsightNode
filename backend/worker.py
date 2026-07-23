@@ -4,6 +4,7 @@ Background worker — drains Kafka ingest topic and dual-writes storage.
 Phase 2: Kafka consumer group, ACK-after-commit, DLQ for poison messages.
 Phase 3 Day 2: each successful batch also inserts into ClickHouse.
 Phase 4 Day 4: ships structured ops logs for DLQ / delivery failures.
+Phase 5 Day 3: extract W3C trace context from Kafka headers → continue traces.
 """
 
 from __future__ import annotations
@@ -37,6 +38,12 @@ from backend.kafka_client import (
 )
 from backend.models import MetricRecord
 from backend import logship as backend_logship
+from backend.tracing import (
+    kafka_consume_span,
+    record_span_error,
+    setup_tracing,
+    shutdown_tracing,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,50 +156,65 @@ def _handle_failed_messages(
 
         db = SessionLocal()
         try:
-            _flush_batch(db, [payload])
-            _commit_messages(consumer, [msg])
-            fail_counts.pop(event_id, None)
-            logger.info("Recovered message event_id=%s on per-item retry", event_id)
-        except Exception as item_error:
-            db.rollback()
-            fail_counts[event_id] = fail_counts.get(event_id, 0) + 1
-            deliveries = fail_counts[event_id]
-            if deliveries >= MAX_DELIVERIES:
-                publish_dlq(
-                    producer,
-                    payload=payload,
-                    reason=f"{reason} | last={type(item_error).__name__}: {item_error}",
-                    delivery_count=deliveries,
-                )
-                _commit_messages(consumer, [msg])
-                fail_counts.pop(event_id, None)
-                logger.error(
-                    "Moved poison message event_id=%s to DLQ after %s deliveries",
-                    event_id,
-                    deliveries,
-                )
-                backend_logship.error(
-                    "worker",
-                    "Moved poison metrics message to DLQ",
-                    event_id=event_id,
-                    deliveries=deliveries,
-                    max_deliveries=MAX_DELIVERIES,
-                    reason=reason,
-                )
-            else:
-                logger.warning(
-                    "Leaving message event_id=%s uncommitted (deliveries=%s/%s)",
-                    event_id,
-                    deliveries,
-                    MAX_DELIVERIES,
-                )
-                backend_logship.warn(
-                    "worker",
-                    "Leaving metrics message uncommitted for retry",
-                    event_id=event_id,
-                    deliveries=deliveries,
-                    max_deliveries=MAX_DELIVERIES,
-                )
+            with kafka_consume_span(
+                msg.headers,
+                destination=msg.topic,
+                event_id=event_id,
+                offset=msg.offset,
+                partition=msg.partition,
+            ) as span:
+                try:
+                    _flush_batch(db, [payload])
+                    _commit_messages(consumer, [msg])
+                    fail_counts.pop(event_id, None)
+                    logger.info(
+                        "Recovered message event_id=%s on per-item retry",
+                        event_id,
+                    )
+                except Exception as item_error:
+                    record_span_error(span, item_error)
+                    db.rollback()
+                    fail_counts[event_id] = fail_counts.get(event_id, 0) + 1
+                    deliveries = fail_counts[event_id]
+                    if deliveries >= MAX_DELIVERIES:
+                        publish_dlq(
+                            producer,
+                            payload=payload,
+                            reason=(
+                                f"{reason} | last="
+                                f"{type(item_error).__name__}: {item_error}"
+                            ),
+                            delivery_count=deliveries,
+                        )
+                        _commit_messages(consumer, [msg])
+                        fail_counts.pop(event_id, None)
+                        logger.error(
+                            "Moved poison message event_id=%s to DLQ after %s deliveries",
+                            event_id,
+                            deliveries,
+                        )
+                        backend_logship.error(
+                            "worker",
+                            "Moved poison metrics message to DLQ",
+                            event_id=event_id,
+                            deliveries=deliveries,
+                            max_deliveries=MAX_DELIVERIES,
+                            reason=reason,
+                        )
+                    else:
+                        logger.warning(
+                            "Leaving message event_id=%s uncommitted (deliveries=%s/%s)",
+                            event_id,
+                            deliveries,
+                            MAX_DELIVERIES,
+                        )
+                        backend_logship.warn(
+                            "worker",
+                            "Leaving metrics message uncommitted for retry",
+                            event_id=event_id,
+                            deliveries=deliveries,
+                            max_deliveries=MAX_DELIVERIES,
+                        )
         finally:
             db.close()
 
@@ -240,14 +262,28 @@ def run_ingest_worker(
                     break
                 continue
 
-            payloads = [m.value for m in messages]
             db = SessionLocal()
             try:
-                _flush_batch(db, payloads)
-                _commit_messages(consumer, messages)
+                # Per-message consume spans keep parent→child timing correct in Jaeger
+                # (each Kafka record may carry a different upstream trace).
                 for m in messages:
-                    eid = str(m.value.get("event_id", ""))
-                    fail_counts.pop(eid, None)
+                    event_id = str(m.value.get("event_id") or "")
+                    with kafka_consume_span(
+                        m.headers,
+                        destination=m.topic,
+                        event_id=event_id or None,
+                        offset=m.offset,
+                        partition=m.partition,
+                    ) as span:
+                        try:
+                            _flush_batch(db, [m.value])
+                        except Exception as exc:
+                            record_span_error(span, exc)
+                            raise
+                    if event_id:
+                        fail_counts.pop(event_id, None)
+
+                _commit_messages(consumer, messages)
             except Exception as exc:
                 logger.exception(
                     "Failed to persist batch of %s messages — falling back per-item",
@@ -273,6 +309,10 @@ def main() -> None:
     )
 
     ensure_topics()
+    # Distinct service.name so Jaeger shows API vs worker as separate nodes.
+    setup_tracing(
+        service_name=os.getenv("OTEL_SERVICE_NAME", "insightnode-worker")
+    )
 
     stop_event = threading.Event()
     consumer_name = default_consumer_name()
@@ -289,7 +329,10 @@ def main() -> None:
         consumer_name,
         os.getenv("KAFKA_BOOTSTRAP", "localhost:9092"),
     )
-    run_ingest_worker(stop_event, consumer_name=consumer_name)
+    try:
+        run_ingest_worker(stop_event, consumer_name=consumer_name)
+    finally:
+        shutdown_tracing()
 
 
 if __name__ == "__main__":

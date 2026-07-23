@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 5 Day 2 — FastAPI HTTP spans**  
-**Next: Phase 5 Day 3 — propagate trace context over Kafka**
+**Current stage: Phase 5 Day 3 — trace context over Kafka**  
+**Next: Phase 5 Day 4 — manual spans for dual-write / logship**
 
-Phase 5 Day 2 auto-instruments FastAPI so each HTTP request (except health/docs) appears as a server span in Jaeger.
+Phase 5 Day 3 propagates W3C `traceparent` agent → API (HTTP) and API → worker (Kafka headers) so one `trace_id` spans the ingest path.
 
 ---
 
@@ -43,7 +43,7 @@ FastAPI (rate limit) ──produce──► Kafka ──workers──► Postgre
 | **Agent resilience** | Retries + on-disk spool |
 | **ClickHouse** | Columnar analytics store (Phase 3 complete) |
 | **OpenSearch** | Centralized logs — ingest, search, agent/API/worker shipping (Phase 4 complete) |
-| **Jaeger (Day 2)** | OTLP + UI; FastAPI HTTP server spans per request |
+| **Jaeger (Day 3)** | OTLP + UI; agent→API→worker linked by W3C context |
 
 ---
 
@@ -55,15 +55,16 @@ InsightNode/
 │   ├── main.py
 │   ├── spool.py
 │   ├── logship.py           # Phase 4 Day 4 — POST /logs from agent
+│   ├── tracing.py           # Phase 5 Day 3 — CLIENT spans + HTTP inject
 │   └── data/
 ├── backend/
 │   ├── main.py              # FastAPI — ingest, query, pipeline, dlq
 │   ├── worker.py            # Kafka consumer → PostgreSQL + ClickHouse
-│   ├── kafka_client.py      # Phase 2 Day 5–6 Kafka helpers
+│   ├── kafka_client.py      # Phase 2 Day 5–6 Kafka helpers (+ Day 3 headers)
 │   ├── clickhouse_client.py # Phase 3 — connect, insert, aggregate
 │   ├── opensearch_client.py # Phase 4 — index, get, search
 │   ├── logship.py           # Phase 4 Day 4 — API/worker → OpenSearch
-│   ├── tracing.py           # Phase 5 — OTEL setup + FastAPI instrumentation
+│   ├── tracing.py           # Phase 5 — OTEL setup, FastAPI, Kafka inject/extract
 │   ├── postgres_aggregate.py# Phase 3 Day 4 — PG aggregate for compare
 │   ├── rate_limit.py        # Phase 2 Day 6 ingest rate limit
 │   ├── redis_client.py      # Phase 2 Days 1–4 (history)
@@ -212,7 +213,7 @@ curl http://127.0.0.1:8001/pipeline
 curl "http://127.0.0.1:8001/dlq?limit=10"
 ```
 
-> See [docs/phase-5-architecture.md](docs/phase-5-architecture.md) for OpenTelemetry (Days 1–2).
+> See [docs/phase-5-architecture.md](docs/phase-5-architecture.md) for OpenTelemetry (Days 1–3).
 > See [docs/phase-4-architecture.md](docs/phase-4-architecture.md) and [docs/phase-4-graduation.md](docs/phase-4-graduation.md).
 > See [docs/phase-3-architecture.md](docs/phase-3-architecture.md) and [docs/phase-3-graduation.md](docs/phase-3-graduation.md).
 > See [docs/phase-2-architecture.md](docs/phase-2-architecture.md) and [docs/phase-2-graduation.md](docs/phase-2-graduation.md).
@@ -441,7 +442,7 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 | 2 | Kafka ingest bus, workers, DLQ, rate limits, `/pipeline` |
 | 3 | ClickHouse dual-write + analytics + PG vs CH compare |
 | 4 | OpenSearch logs — ingest, search, agent/API/worker shipping |
-| 5 | OpenTelemetry / Jaeger — Day 1 collector → Day 2+ instrumentation |
+| 5 | OpenTelemetry / Jaeger — Day 3 context propagation (Kafka + agent) |
 
 ### Later phases
 

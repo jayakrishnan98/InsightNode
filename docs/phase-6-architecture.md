@@ -6,77 +6,72 @@ Phase 6 turns InsightNode from a single-operator lab into a **multi-tenant** lea
 Phase 5:  metrics + logs + traces (three pillars)
 Day 1:    Tenant registry + X-API-Key identity
 Day 2:    Persist / query by tenant_id (storage isolation)
-Day 3:    Per-tenant rate limits (upgrade from machine_id)  ← YOU ARE HERE
-Day 4:    Usage metering + simple quotas
+Day 3:    Per-tenant rate limits (upgrade from machine_id)
+Day 4:    Usage metering + simple quotas  ← YOU ARE HERE
 Day 5:    Sharding concepts + docs + graduation
 ```
 
 ---
 
-## Current architecture (Day 3)
+## Current architecture (Day 4)
 
 ```mermaid
 flowchart LR
   Agent -->|X-API-Key| API[FastAPI]
-  API -->|resolve + rate_limit_max| T[(tenants)]
-  API -->|sliding window per tenant| RL[RateLimiter]
-  RL -->|allow| K[(Kafka / OpenSearch)]
-  RL -->|429| Agent
+  API -->|429 burst| RL[RateLimiter in-memory]
+  API -->|402 monthly| Q[(tenant_usage PG)]
+  RL -->|ok| Q
+  Q -->|ok| Store[(Kafka / OpenSearch)]
 ```
 
-| Before (Phase 2) | After (Phase 6 Day 3) |
-|------------------|------------------------|
-| Key = `machine_id` | Key = `tenant:{tenant_id}` |
-| One noisy host throttled | Whole customer plan ceiling |
-| Fixed `RATE_LIMIT_MAX` | Optional `tenants.rate_limit_max` override |
+| Control | Window | HTTP | Store |
+|---------|--------|------|-------|
+| Rate limit (Day 3) | Sliding seconds | **429** | In-memory |
+| Quota (Day 4) | UTC calendar month | **402** | PostgreSQL `tenant_usage` |
 
-`POST /metrics` and `POST /logs` **share** the same tenant counter — one budget for all ingest.
+### What is counted
+
+| Ingest | Counters |
+|--------|----------|
+| `POST /metrics` | `metric_events` += 1, `metric_points` += len(metrics) |
+| `POST /logs` | `log_events` += len(logs) |
+
+Usage is recorded **after** a successful accept (failed Kafka/OpenSearch is not billed).
 
 ---
 
-## Day 3 lesson — plan ceilings, not host ceilings
+## Day 4 lesson — throttle ≠ bill
 
 ```
-machine_id limit  →  stops one looping agent
-tenant_id limit   →  stops one customer from starving the shared pipeline
+429  →  slow down (burst)
+402  →  plan exhausted (buy more / wait for next month)
 ```
 
-SaaS products sell **tenant** quotas. Host-level limits are still useful as a secondary fairness tool; Day 3 replaces the primary key with the tenant.
-
-| Config | Meaning |
+| Config | Default |
 |--------|---------|
-| `RATE_LIMIT_MAX` | Global default (env) |
-| `tenants.rate_limit_max` | Per-tenant override (`NULL` → use default) |
-| `RATE_LIMIT_WINDOW_SECONDS` | Sliding window length |
-
-Still **in-process** (not Redis) — multi-replica APIs would each count separately until a shared store (same idea as Phase 2 notes).
+| `QUOTA_METRIC_EVENTS_MONTHLY` | `100000` |
+| `QUOTA_LOG_EVENTS_MONTHLY` | `100000` |
+| `QUOTA_METRIC_POINTS_MONTHLY` | `500000` |
+| `tenants.quota_*` | Optional per-tenant override (`NULL` → env default) |
 
 ---
 
 ## Local ops
 
 ```bash
-# See effective limit
-curl http://127.0.0.1:8001/tenants
+curl -H "X-API-Key: dev-local-key" http://127.0.0.1:8001/usage
 
-# Optional: tighten local tenant for a lab
-# psql … -c "UPDATE tenants SET rate_limit_max = 5 WHERE tenant_id = 'local';"
+# Lab: tiny quota then burn it
+psql "$DATABASE_URL" -c "UPDATE tenants SET quota_metric_events = 3 WHERE tenant_id = 'local';"
 
-# Burn the budget (should end in 429)
-for i in $(seq 1 40); do
-  curl -s -o /dev/null -w "%{http_code}\n" -X POST "http://127.0.0.1:8001/metrics" \
-    -H "Content-Type: application/json" \
-    -H "X-API-Key: dev-local-key" \
-    -d "{\"machine_id\":\"rl-$i\",\"timestamp\":\"2026-07-23T12:00:00Z\",\"event_id\":\"$(uuidgen)\",\"metrics\":[{\"name\":\"cpu_usage\",\"value\":1,\"unit\":\"%\"}]}"
-done
+# After a few POSTs → 402 Payment Required
+curl -H "X-API-Key: dev-local-key" http://127.0.0.1:8001/usage
 ```
-
-429 responses include `Retry-After` and `X-RateLimit-Limit`.
 
 ---
 
-## What Day 3 deliberately does not include
+## What Day 4 deliberately does not include
 
-- Cumulative usage metering / monthly quotas → **Day 4**
-- Redis-backed distributed counters → later / production
+- Invoice generation / Stripe billing
+- Soft vs hard quotas / overage fees
 - Physical sharding → **Day 5**

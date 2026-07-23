@@ -22,6 +22,7 @@ from sqlalchemy import Boolean, DateTime, Integer, String, Text, func, select, t
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base, SessionLocal, engine
+from backend.metering import QuotaPlan, effective_quotas, ensure_usage_schema
 from backend.rate_limit import RATE_LIMIT_MAX
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,10 @@ class Tenant(Base):
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     # Phase 6 Day 3: NULL → use global RATE_LIMIT_MAX; else tenant plan ceiling.
     rate_limit_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Phase 6 Day 4: NULL → use QUOTA_*_MONTHLY env defaults.
+    quota_metric_events: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quota_log_events: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quota_metric_points: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -69,6 +74,7 @@ class TenantContext:
     tenant_id: str
     name: str
     rate_limit_max: int  # Effective ceiling (never None after resolve)
+    quotas: QuotaPlan
 
 
 def ensure_tenants_schema_and_seed() -> None:
@@ -92,6 +98,7 @@ def ensure_tenants_schema_and_seed() -> None:
                 "ADD COLUMN IF NOT EXISTS rate_limit_max INTEGER"
             )
         )
+    ensure_usage_schema()
 
     db = SessionLocal()
     try:
@@ -178,6 +185,11 @@ def _context_from_row(row) -> TenantContext:
         tenant_id=row.tenant_id,
         name=row.name,
         rate_limit_max=_effective_rate_limit(row),
+        quotas=effective_quotas(
+            quota_metric_events=row.quota_metric_events,
+            quota_log_events=row.quota_log_events,
+            quota_metric_points=row.quota_metric_points,
+        ),
     )
 
 
@@ -240,17 +252,29 @@ def list_tenants() -> list[dict]:
         rows = db.scalars(
             select(Tenant).where(Tenant.active.is_(True)).order_by(Tenant.tenant_id)
         ).all()
-        return [
-            {
-                "tenant_id": t.tenant_id,
-                "name": t.name,
-                "api_key_hint": _mask_key(t.api_key),
-                "rate_limit_max": _effective_rate_limit(t),
-                "rate_limit_max_override": t.rate_limit_max,
-                "created_at": t.created_at.isoformat() if t.created_at else None,
-            }
-            for t in rows
-        ]
+        out = []
+        for t in rows:
+            q = effective_quotas(
+                quota_metric_events=t.quota_metric_events,
+                quota_log_events=t.quota_log_events,
+                quota_metric_points=t.quota_metric_points,
+            )
+            out.append(
+                {
+                    "tenant_id": t.tenant_id,
+                    "name": t.name,
+                    "api_key_hint": _mask_key(t.api_key),
+                    "rate_limit_max": _effective_rate_limit(t),
+                    "rate_limit_max_override": t.rate_limit_max,
+                    "quotas": {
+                        "metric_events": q.metric_events,
+                        "log_events": q.log_events,
+                        "metric_points": q.metric_points,
+                    },
+                    "created_at": t.created_at.isoformat() if t.created_at else None,
+                }
+            )
+        return out
     finally:
         db.close()
 

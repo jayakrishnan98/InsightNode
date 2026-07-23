@@ -31,11 +31,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_metrics_dedup
 
 -- Phase 6 Day 1: tenant registry (also ensured by backend.tenancy on API boot)
 CREATE TABLE IF NOT EXISTS tenants (
-    tenant_id       VARCHAR(64) PRIMARY KEY,
-    name            VARCHAR(255) NOT NULL,
-    api_key         VARCHAR(128) NOT NULL UNIQUE,
-    active          BOOLEAN NOT NULL DEFAULT TRUE,
-    rate_limit_max  INTEGER,  -- Phase 6 Day 3; NULL = use RATE_LIMIT_MAX env
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    notes           TEXT
+    tenant_id            VARCHAR(64) PRIMARY KEY,
+    name                 VARCHAR(255) NOT NULL,
+    api_key              VARCHAR(128) NOT NULL UNIQUE,
+    active               BOOLEAN NOT NULL DEFAULT TRUE,
+    rate_limit_max       INTEGER,  -- Phase 6 Day 3; NULL = use RATE_LIMIT_MAX env
+    quota_metric_events  INTEGER,  -- Phase 6 Day 4; NULL = use QUOTA_* env
+    quota_log_events     INTEGER,
+    quota_metric_points  INTEGER,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    notes                TEXT
+);
+
+-- Phase 6 Day 4: monthly usage counters (UTC calendar month)
+CREATE TABLE IF NOT EXISTS tenant_usage (
+    id              SERIAL PRIMARY KEY,
+    tenant_id       VARCHAR(64) NOT NULL,
+    period_start    DATE NOT NULL,
+    metric_events   BIGINT NOT NULL DEFAULT 0,
+    log_events      BIGINT NOT NULL DEFAULT 0,
+    metric_points   BIGINT NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT uq_tenant_usage_period UNIQUE (tenant_id, period_start)
 );

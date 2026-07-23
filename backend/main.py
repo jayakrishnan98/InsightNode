@@ -1,9 +1,9 @@
 """
-InsightNode API — multi-tenant ingest with per-tenant rate limits (Phase 6 Day 3).
+InsightNode API — multi-tenant SaaS controls through Phase 6 Day 4.
 
-Architecture (Phase 6 Day 3):
-    X-API-Key → tenant_id; sliding-window rate limit per tenant (metrics + logs).
-    Storage remains tenant-scoped (Day 2).
+Architecture (Phase 6 Day 4):
+    Rate limit (429, burst) + monthly quota (402, plan) before ingest.
+    GET /usage shows current UTC-month counters vs ceilings.
 """
 
 from datetime import datetime
@@ -56,6 +56,7 @@ from backend.rate_limit import (
     tenant_rate_key,
 )
 from backend import logship as backend_logship
+from backend.metering import check_quota, get_usage, record_usage
 from backend.tenancy import (
     DEFAULT_TENANT_ID,
     TENANCY_STRICT,
@@ -150,7 +151,7 @@ async def lifespan(app: FastAPI):
     shutdown_tracing()
 
 
-app = FastAPI(title="InsightNode", version="0.10.2", lifespan=lifespan)
+app = FastAPI(title="InsightNode", version="0.10.3", lifespan=lifespan)
 
 # Phase 5 Day 2: instrument BEFORE the ASGI server starts (cannot add middleware later).
 if setup_tracing():
@@ -329,6 +330,18 @@ def get_tenants():
     return {"count": len(tenants), "tenants": tenants}
 
 
+@app.get("/usage")
+def get_tenant_usage(tenant: TenantContext = Depends(require_tenant)):
+    """
+    Current UTC-month usage vs quotas for the authenticated tenant (Phase 6 Day 4).
+
+    Reason:
+        Customers (and labs) need to see how close they are to plan ceilings —
+        distinct from Day 3's short sliding-window rate limit.
+    """
+    return get_usage(tenant.tenant_id)
+
+
 @app.get("/pipeline")
 def pipeline_status():
     """
@@ -392,6 +405,13 @@ def ingest_logs(
     """
     _enforce_tenant_rate_limit(tenant, route="logs")
 
+    log_count = len(payload.logs)
+    check_quota(
+        tenant_id=tenant.tenant_id,
+        quotas=tenant.quotas,
+        log_events=log_count,
+    )
+
     docs = []
     for log in payload.logs:
         doc = log.model_dump(mode="json")
@@ -408,6 +428,8 @@ def ingest_logs(
 
     if result["errors"]:
         raise HTTPException(status_code=502, detail="OpenSearch bulk index had errors")
+
+    record_usage(tenant_id=tenant.tenant_id, log_events=log_count)
 
     return LogsIngestResponse(
         status="accepted",
@@ -615,6 +637,14 @@ def ingest_metrics(
 
     _enforce_tenant_rate_limit(tenant, route="metrics")
 
+    point_count = len(payload.metrics)
+    check_quota(
+        tenant_id=tenant.tenant_id,
+        quotas=tenant.quotas,
+        metric_events=1,
+        metric_points=point_count,
+    )
+
     item = payload.model_dump(mode="json")
     item["tenant_id"] = tenant.tenant_id
 
@@ -635,6 +665,12 @@ def ingest_metrics(
             detail="Ingest queue full, try again later",
         )
 
+    usage = record_usage(
+        tenant_id=tenant.tenant_id,
+        metric_events=1,
+        metric_points=point_count,
+    )
+
     depth = approximate_lag()
     logger.info(
         "Enqueued metrics tenant=%s machine=%s metric_count=%s lag=%s",
@@ -654,6 +690,7 @@ def ingest_metrics(
             tenant_rate_key(tenant.tenant_id),
             max_requests=tenant.rate_limit_max,
         ),
+        "usage": usage,
     }
 
 

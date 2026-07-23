@@ -2,10 +2,10 @@
 
 A simplified observability platform built to learn system design, distributed systems, and telemetry pipelines. Inspired by Datadog — not a clone.
 
-**Current stage: Phase 6 Day 3 — per-tenant rate limits**  
-**Next: Phase 6 Day 4 — usage metering + quotas**
+**Current stage: Phase 6 Day 4 — usage metering + quotas**  
+**Next: Phase 6 Day 5 — sharding concepts + graduation**
 
-Phase 6 Day 3 rate-limits ingest by `tenant_id` (shared across metrics + logs), with optional per-tenant `rate_limit_max` overrides.
+Phase 6 Day 4 tracks monthly ingest usage in PostgreSQL and rejects with **402** when plan quotas are exceeded (distinct from Day 3's **429** rate limits).
 
 ---
 
@@ -46,7 +46,7 @@ FastAPI (rate limit, HTTP spans) ──produce──► Kafka ──workers─�
 | **ClickHouse** | Columnar analytics store (Phase 3 complete) |
 | **OpenSearch** | Centralized logs — ingest, search, shipping (Phase 4 complete) |
 | **Jaeger / OTEL** | Linked ingest traces; dual-write + logship spans; log `attrs.trace_id` |
-| **Tenancy (Day 3)** | Ingest rate limit keyed by tenant; optional plan ceiling per row |
+| **Tenancy (Day 4)** | Monthly `tenant_usage` metering; quotas → 402; `GET /usage` |
 
 ---
 
@@ -67,7 +67,9 @@ InsightNode/
 │   ├── clickhouse_client.py # Phase 3 — connect, insert, aggregate
 │   ├── opensearch_client.py # Phase 4 — index, get, search
 │   ├── tracing.py           # Phase 5 — OTEL, FastAPI, Kafka, manual spans
-│   ├── tenancy.py           # Phase 6 Day 1 — tenants + X-API-Key resolve
+│   ├── tenancy.py           # Phase 6 — tenants + X-API-Key resolve
+│   ├── metering.py          # Phase 6 Day 4 — usage counters + quotas
+│   ├── rate_limit.py        # Phase 2/6 — sliding-window ingest limits
 │   ├── logship.py           # Phase 4/5 — API/worker → OpenSearch (+ spans)
 │   ├── postgres_aggregate.py# Phase 3 Day 4 — PG aggregate for compare
 │   ├── rate_limit.py        # Phase 2 Day 6 ingest rate limit
@@ -451,7 +453,7 @@ See [docs/bottlenecks-and-roadmap.md](docs/bottlenecks-and-roadmap.md) for scale
 | 3 | ClickHouse dual-write + analytics + PG vs CH compare |
 | 4 | OpenSearch logs — ingest, search, agent/API/worker shipping |
 | 5 | OpenTelemetry / Jaeger — distributed tracing + dual-write spans |
-| 6 | Multi-tenancy — Day 3 per-tenant rate limits (in progress) |
+| 6 | Multi-tenancy — Day 4 usage metering + quotas (in progress) |
 
 ### Later phases
 
